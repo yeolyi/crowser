@@ -37,8 +37,9 @@ const BUILTIN: Record<string, string> = {
   __STDC__: "1",
   __STDC_VERSION__: "201710L",
   __STDC_HOSTED__: "1",
-  // 표준이 고르게 둔 기능 중 없는 것: 복소수, _Atomic, 스레드
+  // 표준이 고르게 둔 기능 중 없는 것: 복소수, _Atomic, 스레드, 가변 길이 배열
   __STDC_NO_COMPLEX__: "1",
+  __STDC_NO_VLA__: "1",
   __STDC_NO_ATOMICS__: "1",
   __STDC_NO_THREADS__: "1",
   true: "1",
@@ -154,49 +155,6 @@ function skipQuoted(s: string, i: number) {
 
 const isIdStart = (c: string) => /[A-Za-z_]/.test(c);
 const isId = (c: string) => /[A-Za-z0-9_]/.test(c);
-
-// 타입 지정자는 표준에선 아무 순서로 써도 되지만(int long unsigned) tree-sitter-c 는 정해진 순서만 읽는다.
-// 이어진 지정자 묶음을 저장 부류·한정자 → signed/unsigned → short/long → char/int/double 순으로 다시 놓는다
-const SPEC_RANK = new Map(
-  [
-    "typedef extern static auto register inline _Noreturn _Thread_local const volatile restrict",
-    "signed unsigned",
-    "short long",
-    "char int float double _Bool _Complex",
-  ].flatMap((ws, rank) => ws.split(" ").map((w) => [w, rank] as const)),
-);
-const orderSpecifiers = (code: string) =>
-  code.replace(
-    /"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|\b[A-Za-z_]\w*(?:[ \t]+[A-Za-z_]\w*)+\b/g,
-    (m) => {
-      if (m[0] === '"' || m[0] === "'") return m;
-      const words = m.split(/([ \t]+)/);
-      // 지정자만 이어진 가장 긴 구간마다 정렬한다
-      const ws = words.filter((_, i) => i % 2 === 0);
-      const out: string[] = [];
-      for (let i = 0; i < ws.length; ) {
-        if (!SPEC_RANK.has(ws[i])) {
-          out.push(ws[i++]);
-          continue;
-        }
-        let j = i;
-        while (j < ws.length && SPEC_RANK.has(ws[j])) j++;
-        out.push(
-          ...ws
-            .slice(i, j)
-            .map((w, k) => [w, k] as const)
-            .sort(
-              (a, b) =>
-                (SPEC_RANK.get(a[0]) ?? 0) - (SPEC_RANK.get(b[0]) ?? 0) ||
-                a[1] - b[1],
-            )
-            .map(([w]) => w),
-        );
-        i = j;
-      }
-      return words.map((w, i) => (i % 2 ? w : out[i / 2])).join("");
-    },
-  );
 
 export function preprocess(src: string): {
   code: string;
@@ -384,14 +342,16 @@ export function preprocess(src: string): {
         let n = t + 1;
         while (/^\s+$/.test(toks[n] ?? "")) n++;
         const next = toks[n] ?? "";
-        res.push(bind.get(next) ?? next);
+        // 붙인 결과가 뒤 토큰과 다시 붙지 않게(+ ## 빈 인자 뒤의 + 가 ++ 가 되지 않게) 띄운다
+        res.push(bind.get(next) ?? next, " ");
         t = n;
         continue;
       }
       const a = bind.get(tok);
       let nextReal = t + 1;
       while (/^\s+$/.test(toks[nextReal] ?? "")) nextReal++;
-      if (a !== undefined) res.push(toks[nextReal] === "##" ? a : full(a));
+      if (a !== undefined)
+        res.push(toks[nextReal] === "##" ? a : ` ${full(a)} `);
       else res.push(tok);
     }
     // 붙이기는 앞 조각과 뒤 조각을 사이 공백 없이 잇는 것
@@ -498,7 +458,7 @@ export function preprocess(src: string): {
       return { code: "", error: { line: e.line, msg: e.message } };
     throw e;
   }
-  return { code: orderSpecifiers(out.join("\n")), error: null };
+  return { code: out.join("\n"), error: null };
 }
 
 function fail(line: number, msg: string): never {

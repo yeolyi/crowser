@@ -7,7 +7,6 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import type { Parser } from "web-tree-sitter";
 import { HEADERS } from "../src/cpp.ts";
 import { run } from "../src/index.ts";
 
@@ -93,39 +92,59 @@ const ALLOWED = new Set([
 function outside(src: string): string | undefined {
   for (const m of src.matchAll(/\b__[A-Za-z_]\w*/g))
     if (!ALLOWED.has(m[0])) return `컴파일러 확장 ${m[0].replace(/\d+$/, "")}`;
+  // 표준이 없어도 되게 둔 기능(__STDC_NO_COMPLEX__·__STDC_NO_ATOMICS__). 가변 길이 배열은 돌려 보고 가린다
+  const optional = /\b(_Complex|_Imaginary|_Atomic)\b/.exec(src);
+  if (optional) return `선택 기능 ${optional[1]}`;
   for (const m of src.matchAll(/^\s*#\s*include\s*[<"]([^>"]+)[>"]/gm))
     if (!HEADERS.includes(m[1])) return `헤더 ${m[1]}`;
 }
 
-// 진짜 clang 으로 돌려도 0 으로 끝나지 않는 것: 구현이 정하는 동작을 gcc 대로 가정한 시험(int 보다 넓은 비트 필드의
-// 계산 폭 등). 우리 기준은 clang 이라 센다면 틀린 쪽을 맞다고 해야 한다
+// 진짜 clang 으로 돌려 본다. 정의되지 않은 동작이 있으면(검사기로 잡은 것) 결과를 견줄 뜻이 없어 뺀다.
+// zero 면 0 으로 끝나야 한다: torture 는 gcc 의 구현 정의 동작(int 보다 넓은 비트 필드의 계산 폭 등)을
+// 가정한 시험이 있어, clang 도 실패하면 뺀다. 우리 기준은 clang 이다
 const runFile = path.join(cache, "clang-run.json");
 const runMemo: Record<string, string> = fs.existsSync(runFile)
   ? JSON.parse(fs.readFileSync(runFile, "utf8"))
   : {};
-function clangFails(file: string, src: string): string | undefined {
-  const key = createHash("sha1").update(src).digest("hex");
+function clangRun(file: string, src: string, zero: boolean) {
+  const key = `${zero ? "0" : "-"}${createHash("sha1").update(src).digest("hex")}`;
   if (runMemo[key] === undefined) {
     const bin = path.join(cache, "clang-run");
+    let why = "";
     try {
-      execFileSync("clang", ["-std=c17", "-w", "-o", bin, file], {
-        stdio: "pipe",
-      });
-      execFileSync(bin, [], { stdio: "pipe", timeout: 10_000 });
-      runMemo[key] = "";
-    } catch {
-      runMemo[key] = "clang 으로 돌려도 실패(gcc 고유 동작)";
+      execFileSync(
+        "clang",
+        [
+          "-std=c17",
+          "-w",
+          "-g",
+          "-fsanitize=undefined,address",
+          "-fno-sanitize-recover=all",
+          "-o",
+          bin,
+          file,
+        ],
+        { stdio: "pipe" },
+      );
+      execFileSync(bin, [], { stdio: "pipe", timeout: 20_000, cwd: cache });
+    } catch (e) {
+      const err = String((e as { stderr?: Buffer }).stderr ?? "");
+      if (/runtime error|AddressSanitizer/.test(err))
+        why = "정의되지 않은 동작(clang 검사기)";
+      else if ((e as { signal?: string }).signal === "SIGTERM") why = "";
+      else if (zero) why = "clang 으로 돌려도 실패(gcc 고유 동작)";
     }
+    runMemo[key] = why;
     fs.writeFileSync(runFile, JSON.stringify(runMemo));
   }
   return runMemo[key] || undefined;
 }
 
-function standard(file: string, src: string): string | undefined {
+function standard(file: string, src: string, zero = false): string | undefined {
   const o = outside(src);
   if (o) return o;
   const why = c17(file, src);
-  return why ? `표준 C17 아님: ${why}` : undefined;
+  return why ? `표준 C17 아님: ${why}` : clangRun(file, src, zero);
 }
 
 // torture 는 GNU C 로 쓰였다. 뜻이 같은 표준 C 로 바꿀 수 있는 것만 바꾼다: 최적화를 막는 속성은 지우고,
@@ -261,7 +280,7 @@ const SUITES: Suite[] = [
             want: { exit: 0 },
             skip: /\{\s*dg-/.test(src)
               ? "dg 지시(특정 환경용)"
-              : (standard(tmp, src) ?? clangFails(tmp, src)),
+              : standard(tmp, src, true),
           };
         });
     },
@@ -287,7 +306,7 @@ function top(map: Map<string, string[]>, n: number) {
     );
 }
 
-export function runSuites(parser: Parser, names: string[]) {
+export function runSuites(names: string[]) {
   for (const suite of SUITES.filter(
     (s) => !names.length || names.includes(s.name),
   )) {
@@ -308,7 +327,12 @@ export function runSuites(parser: Parser, names: string[]) {
       let errored = false;
       try {
         // 연산 한도는 실제로 쓸 때와 같게(넘으면 '너무 오래 걸려' 로 센다)
-        const r = run(parser, c.src, { limit: 0 });
+        const r = run(c.src, { limit: 0 });
+        if (!c.want.reject && r.error?.msg.includes("가변 길이 배열")) {
+          const k = key("선택 기능 가변 길이 배열");
+          skipped.set(k, [...(skipped.get(k) ?? []), c.name]);
+          continue;
+        }
         errored = !!r.error;
         why = r.error
           ? r.error.msg

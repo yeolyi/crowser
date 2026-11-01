@@ -8,9 +8,5 @@
   },
   "scripts": {
     "test": "node test/run.ts"
-  },
-  "dependencies": {
-    "tree-sitter-c": "0.24.1",
-    "web-tree-sitter": "0.27.1"
   }
 }

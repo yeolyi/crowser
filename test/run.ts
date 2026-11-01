@@ -5,15 +5,10 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { loadParser, run } from "../src/index.ts";
+import { run } from "../src/index.ts";
 import { runSuites } from "./suites.ts";
 
 const here = import.meta.dirname;
-const nm = (p: string) => path.join(here, "../node_modules", p);
-const parser = await loadParser(
-  nm("web-tree-sitter/web-tree-sitter.wasm"),
-  nm("tree-sitter-c/tree-sitter-c.wasm"),
-);
 const bin = path.join(here, ".cache/bin");
 fs.mkdirSync(path.dirname(bin), { recursive: true });
 let failed = 0;
@@ -22,7 +17,7 @@ for (const f of fs.readdirSync(path.join(here, "examples")).sort()) {
   const file = path.join(here, "examples", f);
   execFileSync("clang", ["-std=c17", "-w", "-o", bin, file]);
   const want = execFileSync(bin).toString();
-  const r = run(parser, fs.readFileSync(file, "utf8"), { limit: 100_000 });
+  const r = run(fs.readFileSync(file, "utf8"), { limit: 100_000 });
   const got = r.error
     ? `오류 ${r.error.line === null ? "" : r.error.line + 1}: ${r.error.msg}`
     : r.out;
@@ -39,7 +34,7 @@ for (const f of fs.readdirSync(path.join(here, "examples")).sort()) {
 for (const f of fs.readdirSync(path.join(here, "errors")).sort()) {
   const src = fs.readFileSync(path.join(here, "errors", f), "utf8");
   const want = Number(/^\/\/ 오류 (\d+)/.exec(src)?.[1]);
-  const r = run(parser, src);
+  const r = run(src);
   const line = r.error?.line == null ? null : r.error.line + 1;
   if (r.error && line === want)
     console.log(`ok   ${f} (${line}줄: ${r.error.msg})`);
@@ -52,5 +47,5 @@ for (const f of fs.readdirSync(path.join(here, "errors")).sort()) {
 }
 
 const at = process.argv.indexOf("--suite");
-if (at >= 0) runSuites(parser, process.argv.slice(at + 1));
+if (at >= 0) runSuites(process.argv.slice(at + 1));
 process.exit(failed ? 1 : 0);

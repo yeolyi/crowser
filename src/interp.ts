@@ -1,11 +1,10 @@
-// C 부분집합 해석기. tree-sitter-c 의 구문 트리를 따라가며 실행하고, 문장마다 호출 스택의 변수·힙·출력을 기록한다.
+// C 해석기. 직접 쓴 파서(parse.ts)의 구문 트리를 따라가며 실행하고, 문장마다 호출 스택의 변수·힙·출력을 기록한다.
 // 진짜 C 처럼 메모리는 바이트 배열 하나(16MB)다: 문자열 0x1000~, 전역 0x2000~, 힙 0x4000~(위로), 스택은 맨 끝에서 아래로 1MB.
 // 전역이 커서 0x4000 을 넘으면 힙 시작을 그 뒤로 민다(작은 프로그램은 늘 같은 주소).
 // 크기는 64비트 clang 과 같게(char 1, short 2, int 4, long 8, 포인터 8) 맞춰 실제 컴파일러와 출력을 대조할 수 있다.
 // 진짜 C 라면 조용히 망가질 일(배열 밖 인덱스, NULL 따라가기, free 한 메모리 쓰기, 두 번 free)은 그 줄에서 멈추고 알린다.
-import type { Parser } from "web-tree-sitter";
 import { preprocess } from "./cpp.ts";
-import { fixPostfix, fixSwitch, type Node, plain } from "./tree.ts";
+import { type Node, ParseError, parse } from "./parse.ts";
 
 const MEM_SIZE = 0x1000000;
 const STR_BASE = 0x1000;
@@ -407,8 +406,7 @@ type Func = {
   addr: number;
   type: FuncType;
   ret: CType;
-  /** late: int a[n][n] 처럼 크기가 앞 매개변수에 달린 타입. 부를 때마다 그 값으로 다시 센다 */
-  params: { name: string; type: CType; late?: [Node, Node] }[];
+  params: { name: string; type: CType }[];
   /** 매개변수 뒤에 ... 가 있다 */
   variadic: boolean;
   body: Node;
@@ -504,37 +502,7 @@ const wideUnits = (s: string, utf16: boolean) => {
 // 문자열·문자 상수의 접두사(L"…", u'…')에 따른 글자 하나의 타입
 const PREFIX_TYPE: Record<string, CType> = { L: T.int, u: T.ushort, U: T.uint };
 
-type Tree = {
-  type: string;
-  isMissing: boolean;
-  row?: number;
-  children: (Tree | null)[];
-};
-function findError<N extends Tree>(n: N): N | null {
-  // 이름 없는 비트 필드(int : 3)를 tree-sitter 는 빠진 필드 이름으로 읽는다
-  if (n.type === "ERROR" || (n.isMissing && n.type !== "field_identifier"))
-    return n;
-  for (const c of n.children) {
-    if (!c) continue;
-    const e = findError(c as N);
-    if (e) return e;
-  }
-  return null;
-}
-
-/** 문법 오류가 있는 첫 줄(0부터). 없으면 null. 편집기가 치는 동안 쓴다 */
-export function syntaxError(parser: Parser, src: string): CError | null {
-  const pre = preprocess(src);
-  if (pre.error) return pre.error;
-  const tree = parser.parse(pre.code);
-  if (!tree) return null;
-  const e = findError(fixSwitch(plain(tree.rootNode)));
-  tree.delete();
-  return e ? { line: e.row, msg: "문법 오류" } : null;
-}
-
 export function run(
-  parser: Parser,
   src: string,
   {
     limit = 3000,
@@ -542,11 +510,15 @@ export function run(
   }: { limit?: number; ops?: number } = {},
 ): CResult {
   const pre = preprocess(src);
-  const parsed = pre.error ? null : parser.parse(pre.code);
-  const tree = parsed
-    ? { rootNode: fixSwitch(fixPostfix(plain(parsed.rootNode))) }
-    : null;
-  parsed?.delete();
+  let root: Node | null = null;
+  let syntaxErr: CError | null = null;
+  if (!pre.error)
+    try {
+      root = parse(pre.code);
+    } catch (e) {
+      if (!(e instanceof ParseError)) throw e;
+      syntaxErr = { line: e.line, msg: e.message };
+    }
   const mem = new DataView(new ArrayBuffer(MEM_SIZE));
   const structs = new Map<string, StructType>();
   const typedefs = new Map<string, CType>();
@@ -571,7 +543,7 @@ export function run(
     name: string;
     scopes: Map<string, Binding>[];
     va?: number;
-    slots: Map<Node, { addr: number; size: number }>;
+    slots: Map<Node, number>;
   }[] = [];
   const steps: CStep[] = [];
   let out = "";
@@ -589,20 +561,11 @@ export function run(
     n.childForFieldName(name) ?? fail(n, `${name} 이 없습니다`);
 
   const base = { steps, read, truncated: false };
-  if (!tree)
+  if (!root)
     return {
       ...base,
       out,
-      error: pre.error ?? { line: null, msg: "파싱 실패" },
-      exit: 1,
-      leaked: 0,
-    };
-  const syntaxErr = findError(tree.rootNode);
-  if (syntaxErr)
-    return {
-      ...base,
-      out,
-      error: { line: lineOf(syntaxErr), msg: "문법 오류" },
+      error: pre.error ?? syntaxErr,
       exit: 1,
       leaked: 0,
     };
@@ -743,44 +706,7 @@ export function run(
   }
 
   // --- 타입 읽기 ---
-  // T (*fp)(int) = f; 처럼 typedef 이름 뒤에 ( 가 오는 선언을 tree-sitter 는 T 를 부르는 식으로 읽는다
-  // (typedef 이름을 모른다). T 자리를 int 로 바꿔 다시 읽고, 그 타입 자리만 T 로 둔 선언으로 바꾼다
-  const typeOverride = new WeakMap<Node, CType>();
-  const reparsed = new WeakMap<Node, Node | null>();
-  const typedefName = (name: string): CType | undefined => {
-    const local = findScoped(name);
-    if (local) return local.kind === "typedef" ? local.type : undefined;
-    return globals.has(name) || funcs.has(name)
-      ? undefined
-      : typedefs.get(name);
-  };
-  const typedefDecl = (n: Node): Node | null => {
-    const m = /^(\s*)([A-Za-z_]\w*)(\s*\()/.exec(n.text);
-    const t = m && typedefName(m[2]);
-    if (!m || !t) return null;
-    let d = reparsed.get(n);
-    if (d === undefined) {
-      const text = `${m[1]}int ${n.text.slice(m[1].length + m[2].length)}`;
-      const tree = parser.parse(text);
-      const root = tree ? plain(tree.rootNode) : null;
-      tree?.delete();
-      const decl = root?.namedChildren[0];
-      d = decl?.type === "declaration" && !findError(decl) ? decl : null;
-      if (d) {
-        const shift = (x: Node) => {
-          x.row += n.row;
-          for (const c of x.children) shift(c);
-        };
-        shift(d);
-      }
-      reparsed.set(n, d);
-    }
-    if (d) typeOverride.set(field(d, "type"), t);
-    return d;
-  };
   const typeOf = (node: Node): CType => {
-    const forced = typeOverride.get(node);
-    if (forced) return forced;
     switch (node.type) {
       case "primitive_type":
       case "sized_type_specifier": {
@@ -992,15 +918,13 @@ export function run(
       case "identifier":
       case "field_identifier":
       case "type_identifier":
-      // tree-sitter 는 int16_t 같은 표준 이름을 타입으로 읽는다. typedef 로 다시 정의할 때 그 자리가 이름이다
-      case "primitive_type":
         return { name: d.text, type: b };
       case "pointer_declarator":
         return declare(ptr(b), field(d, "declarator"));
       case "array_declarator": {
         const sizeNode = d.childForFieldName("size");
         return declare(
-          arr(b, sizeNode ? constEval(sizeNode) : 0),
+          arr(b, sizeNode ? arraySize(sizeNode) : 0),
           field(d, "declarator"),
         );
       }
@@ -1039,7 +963,7 @@ export function run(
       case "abstract_array_declarator": {
         const s = d.childForFieldName("size");
         return abstract(
-          arr(b, s ? constEval(s) : 0),
+          arr(b, s ? arraySize(s) : 0),
           d.childForFieldName("declarator"),
         );
       }
@@ -1056,6 +980,41 @@ export function run(
   };
 
   const constEval = (n: Node): number => num(rvalue(n, evalExpr(n)).v);
+  // 정수 상수식(C17 6.6): 수·문자·enum 상수·sizeof 와 그것들의 연산. 변수는 값이 있어도 아니다
+  const isConst = (n: Node): boolean => {
+    switch (n.type) {
+      case "number_literal":
+      case "char_literal":
+      case "sizeof_expression":
+      case "alignof_expression":
+      case "offsetof_expression":
+        return true;
+      case "identifier": {
+        const local = findScoped(n.text);
+        return local ? local.kind === "enum" : enums.has(n.text);
+      }
+      case "parenthesized_expression":
+      case "unary_expression":
+      case "binary_expression":
+      case "conditional_expression":
+        return n.namedChildren.every(isConst);
+      case "cast_expression":
+        return isConst(field(n, "value"));
+      default:
+        return false;
+    }
+  };
+  // 배열 크기는 상수여야 한다. 실행 중에 크기가 정해지는 가변 길이 배열(int a[n])은 없다(__STDC_NO_VLA__)
+  const arraySize = (n: Node): number => {
+    if (!isConst(n))
+      fail(
+        n,
+        "배열 크기는 상수여야 합니다. 가변 길이 배열(int a[n])은 지원하지 않으니 malloc 을 씁시다",
+      );
+    const size = constEval(n);
+    if (size < 0) fail(n, "배열 크기가 음수입니다");
+    return size;
+  };
 
   // --- 변수 ---
   const frame = () => frames[frames.length - 1];
@@ -1526,9 +1485,7 @@ export function run(
           return { t: f ? T.float : T.double, v: f ? Math.fround(v) : v };
         }
         const suffix = /[uUlL]*$/.exec(n.text)?.[0].toLowerCase() ?? "";
-        // tree-sitter 가 앞의 - 까지 수에 붙여 읽을 때가 있다. 수와 단항 - 로 나눠 계산한다
-        const minus = n.text.startsWith("-");
-        const text = n.text.slice(minus ? 1 : 0, n.text.length - suffix.length);
+        const text = n.text.slice(0, n.text.length - suffix.length);
         // 0 으로 시작하면 8진수(017 은 15). BigInt 가 0x·0o·0b 를 읽는다
         const v = BigInt(text.replace(/^0(?=[0-7])/, "0o"));
         // 값이 들어가는 첫 타입(C17 6.4.4.1). 10진수는 부호 있는 타입만, 16·8진수는 부호 없는 것도 거친다
@@ -1547,7 +1504,7 @@ export function run(
         const fits = (t: IntType) =>
           v < 2n ** BigInt(t.size * 8 - (t.signed ? 1 : 0));
         const t = types.find(fits) ?? T.ulong;
-        return { t, v: minus ? wrap(t, -v) : norm(v) };
+        return { t, v: norm(v) };
       }
       case "char_literal": {
         const q = n.text.indexOf("'");
@@ -1568,10 +1525,6 @@ export function run(
         return evalLiteral(n);
       case "null":
         return { t: ptr(T.void), v: 0 };
-      case "true":
-        return { t: T.int, v: 1 };
-      case "false":
-        return { t: T.int, v: 0 };
       case "identifier": {
         const name = n.text;
         const local = findScoped(name);
@@ -1588,10 +1541,6 @@ export function run(
         if (stream && !lookupMaybe(name)) return { t: ptr(FILE), v: stream };
         if (name === "__func__" && !lookupMaybe(name))
           return evalString(frame()?.name ?? "");
-        // sizeof(T) 의 T 처럼 타입 이름이 식 자리에 오면 파서는 이름으로 읽는다. 값 없이 타입만 준다
-        const typeName =
-          !lookupMaybe(name) && (typedefs.get(name) ?? STD_TYPES[name]);
-        if (typeName) return { t: typeName, v: 0 };
         const v = lookup(n, name);
         return { t: v.type, addr: v.addr, lv: true };
       }
@@ -1739,7 +1688,7 @@ export function run(
       }
       case "alignof_expression": {
         const tn = n.childForFieldName("type");
-        const t = tn ? descriptorOrExpr(tn) : typeOnly(field(n, "value"));
+        const t = tn ? typeOfDescriptor(tn) : typeOnly(field(n, "value"));
         return { t: T.ulong, v: (t.k === "array" ? elemOf(t) : t).align };
       }
       case "offsetof_expression": {
@@ -1770,7 +1719,7 @@ export function run(
       }
       case "sizeof_expression": {
         const tn = n.childForFieldName("type");
-        if (tn) return { t: T.ulong, v: descriptorOrExpr(tn).size };
+        if (tn) return { t: T.ulong, v: typeOfDescriptor(tn).size };
         return { t: T.ulong, v: typeOnly(field(n, "value")).size };
       }
       case "cast_expression": {
@@ -1811,14 +1760,8 @@ export function run(
         if (dry) return { t, addr: 0, lv: true };
         // 같은 식을 다시 지나면(반복·goto) 같은 자리를 다시 쓴다. 표준에서도 같은 객체다
         const f = frames.length ? frame() : null;
-        const slot = f?.slots.get(n);
-        const addr =
-          slot && slot.size === t.size
-            ? slot.addr
-            : f
-              ? alloca(n, t)
-              : staticAlloc(n, t);
-        f?.slots.set(n, { addr, size: t.size });
+        const addr = f?.slots.get(n) ?? (f ? alloca(n, t) : staticAlloc(n, t));
+        f?.slots.set(n, addr);
         initialize(n, addr, t, init);
         return { t, addr, lv: true };
       }
@@ -1832,25 +1775,6 @@ export function run(
     return globals.has(name);
   };
 
-  // sizeof(f()) 와 sizeof(x) 를 파서가 타입(f 를 돌려주는 함수, 타입 x)으로 읽을 때가 있다.
-  // 그 이름이 타입이 아니라 함수나 변수면 식으로 본다
-  const descriptorOrExpr = (td: Node): CType => {
-    const base = field(td, "type");
-    const name = base.text;
-    if (
-      base.type === "type_identifier" &&
-      findScoped(name)?.kind !== "typedef" &&
-      !typedefs.has(name) &&
-      !STD_TYPES[name] &&
-      (funcs.has(name) || lookupMaybe(name))
-    ) {
-      const d = td.childForFieldName("declarator");
-      if (d?.type === "abstract_function_declarator")
-        return funcs.get(name)?.ret ?? T.int;
-      if (!d) return lookup(base, name).type;
-    }
-    return typeOfDescriptor(td);
-  };
   const typeOfDescriptor = (td: Node): CType =>
     abstract(typeOf(field(td, "type")), td.childForFieldName("declarator"));
 
@@ -2483,13 +2407,11 @@ export function run(
       name: f.name,
       scopes: [new Map<string, Binding>()],
       va,
-      slots: new Map<Node, { addr: number; size: number }>(),
+      slots: new Map<Node, number>(),
     };
     frames.push(fr);
     f.params.forEach((p, i) => {
-      const type = p.late
-        ? paramType(declare(typeOf(p.late[0]), p.late[1]).type)
-        : p.type;
+      const type = p.type;
       const addr = alloca(at, type);
       fr.scopes[0].set(p.name, { addr, type });
       assign(at, { t: type, addr, lv: true }, args[i]);
@@ -2653,11 +2575,11 @@ export function run(
         scope.set(name, { addr: d.memo, type });
         continue;
       }
-      // 반복이나 goto 로 같은 선언을 다시 지나면 그 자리를 다시 쓴다(크기가 바뀌는 가변 길이 배열은 새로)
+      // 반복이나 goto 로 같은 선언을 다시 지나면 그 자리를 다시 쓴다
       const slot = frame().slots.get(d);
-      const reuse = slot !== undefined && slot.size === type.size;
-      const addr = reuse ? slot.addr : alloca(n, type);
-      frame().slots.set(d, { addr, size: type.size });
+      const reuse = slot !== undefined;
+      const addr = slot ?? alloca(n, type);
+      frame().slots.set(d, addr);
       scope.set(name, { addr, type, decl: n });
       // 처음 잡은 자리는 초기화하지 않은 값으로 채운다
       if (!reuse)
@@ -2702,8 +2624,7 @@ export function run(
   };
   const labeled = (n: Node) =>
     n.namedChildren.at(-1) ?? fail(n, "레이블 뒤에 문장이 없습니다");
-  const stmts = (n: Node) =>
-    n.namedChildren.filter((c) => c.type !== "comment");
+  const stmts = (n: Node) => n.namedChildren;
 
   // 건너뛴 문장 안에서 이 블록에 이름을 만드는 선언(case·레이블은 블록이 아니라 그 안의 선언도 이 블록 것)
   const TYPE_DECLS = new Set([
@@ -2886,9 +2807,7 @@ export function run(
         return;
       case "expression_statement": {
         record(n);
-        const d = typedefDecl(n);
-        if (d) declareLocal(d);
-        else if (n.namedChildren[0]) evalExpr(n.namedChildren[0]);
+        if (n.namedChildren[0]) evalExpr(n.namedChildren[0]);
         return;
       }
       case "return_statement": {
@@ -2944,7 +2863,6 @@ export function run(
         throw new Break();
       case "continue_statement":
         throw new Continue();
-      case "comment":
       case ";":
         return;
       case "labeled_statement":
@@ -2961,8 +2879,6 @@ export function run(
   // --- 맨 위 선언 ---
   function topLevel(top: Node) {
     switch (top.type) {
-      case "comment":
-        return;
       case "struct_specifier":
       case "union_specifier":
       case "enum_specifier":
@@ -3001,17 +2917,8 @@ export function run(
             if (pt.text === "void") continue;
             return fail(p, "매개변수 이름이 없습니다");
           }
-          try {
-            const pdecl = declare(typeOf(pt), pd);
-            params.push({ name: pdecl.name, type: paramType(pdecl.type) });
-          } catch (e) {
-            if (!(e instanceof Fail)) throw e;
-            params.push({
-              name: declaredName(pd),
-              type: ptr(T.void),
-              late: [pt, pd],
-            });
-          }
+          const pdecl = declare(typeOf(pt), pd);
+          params.push({ name: pdecl.name, type: paramType(pdecl.type) });
         }
         const known = funcs.get(name);
         const f = {
@@ -3063,11 +2970,6 @@ export function run(
       case "expression_statement": {
         if (top.text.trim() === ";") return;
         const e = top.namedChildren[0];
-        const d = typedefDecl(top);
-        if (d) {
-          markDefined(d);
-          return topLevel(d);
-        }
         if (e?.type === "call_expression" && isStaticAssert(e)) {
           staticAssert(e);
           return;
@@ -3089,7 +2991,7 @@ export function run(
   const declaredName = (d: Node): string => {
     const inner = d.childForFieldName("declarator");
     if (inner) return declaredName(inner);
-    const named = d.namedChildren.find((c) => c.type !== "comment");
+    const named = d.namedChildren[0];
     return d.type === "identifier" || !named ? d.text : declaredName(named);
   };
   // 정의가 있는 전역 이름: extern 이 아니거나 초기화가 있는 선언
@@ -3099,7 +3001,7 @@ export function run(
       if (d && (!storage(top, "extern") || d.type === "init_declarator"))
         defined.add(declaredName(d));
   };
-  for (const top of tree?.rootNode.namedChildren ?? [])
+  for (const top of root.namedChildren ?? [])
     if (top.type === "declaration") markDefined(top);
 
   // 함수 안 static 변수들의 크기 합. 타입을 셀 수 없는 것(그 블록에서 만든 struct 등)은 0 으로 친다
@@ -3126,15 +3028,15 @@ export function run(
   let error: CError | null = null;
   let exit = 0;
   try {
-    collectStrings(tree.rootNode);
+    collectStrings(root);
     globalTop = Math.max(GLOBAL_BASE, Math.ceil(strTop / 0x1000) * 0x1000);
-    for (const top of tree.rootNode.namedChildren) if (top) topLevel(top);
+    for (const top of root.namedChildren) if (top) topLevel(top);
     // 실행 중에 생기는 static 지역 변수 자리를 남기고 힙을 시작한다
     heapBase = Math.max(
       HEAP_BASE,
       Math.ceil(
         (globalTop +
-          tree.rootNode.namedChildren
+          root.namedChildren
             .filter((f) => f.type === "function_definition")
             .reduce((sum, f) => sum + staticLocals(field(f, "body")), 0) +
           0x1000) /
@@ -3145,15 +3047,13 @@ export function run(
     started = true;
     const main = funcs.get("main") ?? fail(null, "main 함수가 없습니다");
     // int main(int argc, char **argv) 면 프로그램 이름 하나만 넘긴다
-    const argv = staticAlloc(tree.rootNode, arr(ptr(T.char), 2));
+    const argv = staticAlloc(root, arr(ptr(T.char), 2));
     store(null, argv, ptr(T.char), strAddr("main"));
     const mainArgs: Val[] = [
       { t: T.int, v: 1 },
       { t: ptr(ptr(T.char)), v: argv },
     ];
-    exit = num(
-      invoke(main, mainArgs.slice(0, main.params.length), tree.rootNode).v,
-    );
+    exit = num(invoke(main, mainArgs.slice(0, main.params.length), root).v);
   } catch (e) {
     if (e instanceof Fail) error = { line: e.line, msg: e.message };
     else if (e instanceof Exit) exit = e.code;
