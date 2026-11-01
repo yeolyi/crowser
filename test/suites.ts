@@ -256,7 +256,11 @@ function top(map: Map<string, string[]>, n: number) {
   for (const [k, v] of [...map]
     .sort((a, b) => b[1].length - a[1].length)
     .slice(0, n))
-    console.log(String(v.length).padStart(5), k, v.slice(0, 3).join(" "));
+    console.log(
+      String(v.length).padStart(5),
+      k,
+      (process.env.ALL ? v : v.slice(0, 3)).join(" "),
+    );
 }
 
 export function runSuites(parser: Parser, names: string[]) {

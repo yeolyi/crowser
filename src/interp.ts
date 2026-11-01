@@ -311,7 +311,7 @@ type Func = {
   variadic: boolean;
   body: Node;
 };
-// decl: 이 이름을 만든 선언. goto 로 같은 선언을 다시 지나면 자리를 새로 잡지 않고 다시 쓴다
+// decl: 이 이름을 만든 선언문. goto 로 그 앞으로 돌아가면 이름을 지운다
 type Binding = { addr: number; type: CType; decl?: Node };
 
 const hex = (v: number) => `0x${v.toString(16)}`;
@@ -332,6 +332,8 @@ const hexFloat = (text: string) => {
   const mant = Number.parseInt(`${m[2]}${frac}` || "0", 16) / 16 ** frac.length;
   return (m[1] ? -1 : 1) * mant * 2 ** Number(m[4]);
 };
+// C 의 참: 0 이 아니면 참(NaN 도 참이다. JS 에선 NaN 이 거짓이라 따로 본다)
+const truth = (v: Num) => v !== 0 && v !== 0n;
 const neg = (v: Num): Num => (typeof v === "number" ? -v : norm(-v));
 const ESC: Record<string, string> = {
   n: "\n",
@@ -416,10 +418,12 @@ export function run(
   let sp = STACK_TOP;
   let ops = 0;
   // va: 가변 인자 함수면 넘겨받은 가변 인자의 첫 칸 주소
+  // slots: 이 호출에서 선언마다 잡은 자리. goto 로 같은 선언을 다시 지나면 그 자리를 다시 쓴다
   const frames: {
     name: string;
     scopes: Map<string, Binding>[];
     va?: number;
+    slots: Map<Node, { addr: number; size: number }>;
   }[] = [];
   const steps: CStep[] = [];
   let out = "";
@@ -538,7 +542,7 @@ export function run(
   function wrap(t: CType, v: Num): Num {
     if (t.k === "float") return t.size === 4 ? Math.fround(num(v)) : num(v);
     if (t.k !== "int") return num(v);
-    if (t === T.bool) return v ? 1 : 0;
+    if (t === T.bool) return truth(v) ? 1 : 0;
     if (t.size === 8) {
       if (typeof v === "number") {
         const x = Math.trunc(v);
@@ -748,9 +752,12 @@ export function run(
       }
     return globals.get(name) ?? fail(n, `선언하지 않은 이름 ${name}`);
   };
+  // 16바이트 이상인 배열은 16바이트 경계에 둔다(64비트 ABI 와 같게)
+  const alignOf = (t: CType) =>
+    t.k === "array" && t.size >= 16 ? Math.max(t.align, 16) : t.align;
   const alloca = (n: Node, type: CType) => {
     sp -= type.size;
-    sp -= sp % Math.max(type.align, 1);
+    sp -= sp % Math.max(alignOf(type), 1);
     if (sp < HEAP_END) fail(n, "스택이 넘쳤습니다(재귀가 너무 깊습니다)");
     return sp;
   };
@@ -768,7 +775,7 @@ export function run(
     n.type === "string_literal"
       ? unquote(n.text.slice(1, -1))
       : n.namedChildren.map((c) => unquote(c.text.slice(1, -1))).join("");
-  const evalString = (n: Node, str: string): Place => ({
+  const evalString = (str: string): Place => ({
     t: arr(T.char, str.length + 1),
     addr: strAddr(str),
     lv: true,
@@ -1088,7 +1095,7 @@ export function run(
       // 문자열 상수는 char 배열이다(sizeof "ab" 는 3, 쓰면 첫 글자 주소로 바뀐다)
       case "string_literal":
       case "concatenated_string":
-        return evalString(n, literal(n));
+        return evalString(literal(n));
       case "null":
         return { t: ptr(T.void), v: 0 };
       case "true":
@@ -1104,7 +1111,7 @@ export function run(
         const stream = STREAMS[name];
         if (stream && !lookupMaybe(name)) return { t: ptr(FILE), v: stream };
         if (name === "__func__" && !lookupMaybe(name))
-          return evalString(n, frame()?.name ?? "");
+          return evalString(frame()?.name ?? "");
         // sizeof(T) 의 T 처럼 타입 이름이 식 자리에 오면 파서는 이름으로 읽는다. 값 없이 타입만 준다
         const typeName =
           !lookupMaybe(name) && (typedefs.get(name) ?? STD_TYPES[name]);
@@ -1131,12 +1138,18 @@ export function run(
         if (op === "&&")
           return {
             t: T.int,
-            v: a.v && rvalue(n, evalExpr(field(n, "right"))).v ? 1 : 0,
+            v:
+              truth(a.v) && truth(rvalue(n, evalExpr(field(n, "right"))).v)
+                ? 1
+                : 0,
           };
         if (op === "||")
           return {
             t: T.int,
-            v: a.v || rvalue(n, evalExpr(field(n, "right"))).v ? 1 : 0,
+            v:
+              truth(a.v) || truth(rvalue(n, evalExpr(field(n, "right"))).v)
+                ? 1
+                : 0,
           };
         return arith(n, op, a, rvalue(n, evalExpr(field(n, "right"))));
       }
@@ -1146,7 +1159,7 @@ export function run(
         const t = a.t.k === "int" && a.t.size < 4 ? T.int : a.t;
         if (op === "-") return { t, v: wrap(t, neg(a.v)) };
         if (op === "+") return { t, v: a.v };
-        if (op === "!") return { t: T.int, v: a.v ? 0 : 1 };
+        if (op === "!") return { t: T.int, v: truth(a.v) ? 0 : 1 };
         if (op === "~")
           return { t, v: wrap(t, t.size === 8 ? ~big(a.v) : ~num(a.v)) };
         return fail(n, `지원하지 않는 연산자 ${op}`);
@@ -1230,10 +1243,25 @@ export function run(
       }
       case "conditional_expression": {
         const c = rvalue(n, evalExpr(field(n, "condition")));
-        return rvalue(
-          n,
-          evalExpr(field(n, c.v ? "consequence" : "alternative")),
-        );
+        const yes = truth(c.v);
+        const pick = field(n, yes ? "consequence" : "alternative");
+        const v = rvalue(n, evalExpr(pick));
+        // 두 갈래가 다 수면 둘의 공통 타입으로(고르지 않은 쪽은 타입만 본다)
+        const other = typeOnly(field(n, yes ? "alternative" : "consequence"));
+        const o = other.k === "array" ? ptr(other.of) : other;
+        if (
+          (v.t.k === "int" || v.t.k === "float") &&
+          (o.k === "int" || o.k === "float")
+        ) {
+          const t =
+            v.t === T.double || o === T.double
+              ? T.double
+              : v.t.k === "float" || o.k === "float"
+                ? T.float
+                : promote(v.t, o);
+          return { t, v: wrap(t, v.v) };
+        }
+        return v;
       }
       case "call_expression":
         return call(n);
@@ -1837,7 +1865,12 @@ export function run(
         off += slots[i];
       });
     }
-    const fr = { name: f.name, scopes: [new Map<string, Binding>()], va };
+    const fr = {
+      name: f.name,
+      scopes: [new Map<string, Binding>()],
+      va,
+      slots: new Map<Node, { addr: number; size: number }>(),
+    };
     frames.push(fr);
     f.params.forEach((p, i) => {
       const addr = alloca(at, p.type);
@@ -1957,7 +1990,7 @@ export function run(
     );
   const isStatic = (n: Node) => storage(n, "static");
   const staticAlloc = (n: Node | null, type: CType) => {
-    globalTop = Math.ceil(globalTop / type.align) * type.align;
+    globalTop = Math.ceil(globalTop / alignOf(type)) * alignOf(type);
     const addr = globalTop;
     globalTop += type.size;
     if (globalTop > (started ? heapBase : HEAP_END - 0x100000))
@@ -2002,13 +2035,15 @@ export function run(
         scope.set(name, { addr: d.memo, type });
         continue;
       }
-      const again = scope.get(name);
-      const addr =
-        again?.decl === d && again.type.size === type.size
-          ? again.addr
-          : alloca(n, type);
-      scope.set(name, { addr, type, decl: d });
-      for (let i = 0; i < type.size; i++) mem.setUint8(addr + i, 0xcd); // 초기화하지 않은 값
+      // 반복이나 goto 로 같은 선언을 다시 지나면 그 자리를 다시 쓴다(크기가 바뀌는 가변 길이 배열은 새로)
+      const slot = frame().slots.get(d);
+      const reuse = slot !== undefined && slot.size === type.size;
+      const addr = reuse ? slot.addr : alloca(n, type);
+      frame().slots.set(d, { addr, size: type.size });
+      scope.set(name, { addr, type, decl: n });
+      // 처음 잡은 자리는 초기화하지 않은 값으로 채운다
+      if (!reuse)
+        for (let i = 0; i < type.size; i++) mem.setUint8(addr + i, 0xcd);
       if (init && withInit) initialize(d, addr, type, init);
     }
   }
@@ -2017,11 +2052,32 @@ export function run(
   // goto 는 Goto 를 던지고, 그 레이블을 안에 품은 가장 가까운 블록이 받아 레이블이 있는 문장부터 다시 실행한다.
   // 레이블이 안쪽 블록·if·반복 안에 있으면 그 안으로 들어가며(resume) 이어 간다
   const labelMemo = new WeakMap<Node, Set<string>>();
+  // case 의 레이블 이름. 사람이 쓰는 레이블과 겹치지 않게 공백을 넣는다
+  const caseKeys = new WeakMap<Node, string>();
+  let caseCount = 0;
+  const caseKey = (n: Node) => {
+    let k = caseKeys.get(n);
+    if (!k) {
+      k = `case ${caseCount++}`;
+      caseKeys.set(n, k);
+    }
+    return k;
+  };
+  // 이 switch 의 case 들(안쪽 switch 의 것은 빼고)
+  const casesOf = (n: Node): Node[] =>
+    n.type === "case_statement"
+      ? [n, ...caseBody(n).flatMap(casesOf)]
+      : n.type === "switch_statement"
+        ? []
+        : n.namedChildren.flatMap(casesOf);
+  const caseBody = (n: Node) =>
+    stmts(n).slice(n.childForFieldName("value") ? 1 : 0);
   const labelsOf = (n: Node): Set<string> => {
     let set = labelMemo.get(n);
     if (set) return set;
     set = new Set();
     if (n.type === "labeled_statement") set.add(field(n, "label").text);
+    if (n.type === "case_statement") set.add(caseKey(n));
     for (const c of n.namedChildren) for (const l of labelsOf(c)) set.add(l);
     labelMemo.set(n, set);
     return set;
@@ -2031,6 +2087,8 @@ export function run(
   const stmts = (n: Node) =>
     n.namedChildren.filter((c) => c.type !== "comment");
 
+  const declaredHere = (scope: Map<string, Binding>, k: Node) =>
+    [...scope.values()].some((b) => b.decl === k);
   function runBlock(n: Node, start: string | null) {
     frame().scopes.push(new Map());
     try {
@@ -2042,9 +2100,14 @@ export function run(
           if (target !== null) {
             const label = target;
             const at = kids.findIndex((k) => labelsOf(k).has(label));
+            // 레이블 뒤에서 선언한 이름은 레이블 자리에선 아직 없다(바깥 이름이 보인다)
+            const scope = frame().scopes[frame().scopes.length - 1];
+            for (const [name, b] of scope)
+              if (b.decl && kids.indexOf(b.decl) >= at) scope.delete(name);
             // 건너뛴 선언도 그 블록 안에선 이름이 있다
             for (const k of kids.slice(0, at))
-              if (k.type === "declaration") declareLocal(k, false);
+              if (k.type === "declaration" && !declaredHere(scope, k))
+                declareLocal(k, false);
             target = null;
             i = at + 1;
             resume(kids[at], label);
@@ -2067,6 +2130,20 @@ export function run(
         if (field(n, "label").text === label) exec(labeled(n));
         else resume(labeled(n), label);
         return;
+      case "case_statement": {
+        // case 는 블록이 아니라 이어지는 문장들이다(이름 범위가 새로 생기지 않는다)
+        const kids = caseBody(n);
+        if (caseKey(n) === label) {
+          for (const k of kids) exec(k);
+          return;
+        }
+        const at = kids.findIndex((k) => labelsOf(k).has(label));
+        for (const k of kids.slice(0, at))
+          if (k.type === "declaration") declareLocal(k, false);
+        resume(kids[at], label);
+        for (const k of kids.slice(at + 1)) exec(k);
+        return;
+      }
       case "compound_statement":
         runBlock(n, label);
         return;
@@ -2107,7 +2184,7 @@ export function run(
   function loop(n: Node, into: string | null) {
     const cond = () => {
       record(n);
-      return rvalue(n, evalExpr(field(n, "condition"))).v;
+      return truth(rvalue(n, evalExpr(field(n, "condition"))).v);
     };
     let first = into;
     // while 은 조건부터, do 는 몸통부터. 몸통 안으로 들어왔으면 몸통을 마저 하고 조건으로
@@ -2133,7 +2210,7 @@ export function run(
       for (;;) {
         if (first === null) {
           record(n);
-          if (cond && !rvalue(n, evalExpr(cond)).v) break;
+          if (cond && !truth(rvalue(n, evalExpr(cond)).v)) break;
         }
         if (body(field(n, "body"), first) === "break") break;
         first = null;
@@ -2172,7 +2249,7 @@ export function run(
       case "if_statement": {
         record(n);
         const c = rvalue(n, evalExpr(field(n, "condition")));
-        if (c.v) exec(field(n, "consequence"));
+        if (truth(c.v)) exec(field(n, "consequence"));
         else {
           const alt = n.childForFieldName("alternative");
           if (alt)
@@ -2189,30 +2266,30 @@ export function run(
       case "for_statement":
         forLoop(n, null);
         return;
+      // case 는 이 switch 의 레이블이다. 맞는 case(없으면 default)로 goto 하듯 몸통 안으로 들어간다.
+      // case 값은 조건식의 (승격한) 타입으로 바꿔 비교한다
       case "switch_statement": {
         record(n);
-        const v = rvalue(n, evalExpr(field(n, "condition"))).v;
-        const cases = field(n, "body").namedChildren.filter(
-          (c): c is Node => !!c && c.type === "case_statement",
-        );
-        let start = cases.findIndex((c) => {
-          const val = c.childForFieldName("value");
-          return val && constEval(val) === v;
-        });
-        if (start < 0)
-          start = cases.findIndex((c) => !c.childForFieldName("value"));
-        if (start < 0) return;
+        const c = rvalue(n, evalExpr(field(n, "condition")));
+        const t = c.t.k === "int" ? promote(c.t, c.t) : c.t;
+        const body = field(n, "body");
+        const cases = casesOf(body);
+        const hit =
+          cases.find((k) => {
+            const val = k.childForFieldName("value");
+            return val && wrap(t, rvalue(val, evalExpr(val)).v) === c.v;
+          }) ?? cases.find((k) => !k.childForFieldName("value"));
+        if (!hit) return;
         try {
-          for (const c of cases.slice(start))
-            for (const s of c.namedChildren.slice(
-              c.childForFieldName("value") ? 1 : 0,
-            ))
-              if (s && s.type !== "comment") exec(s);
+          resume(body, caseKey(hit));
         } catch (e) {
           if (!(e instanceof Break)) throw e;
         }
         return;
       }
+      case "case_statement":
+        for (const k of caseBody(n)) exec(k);
+        return;
       case "break_statement":
         throw new Break();
       case "continue_statement":
