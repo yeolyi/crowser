@@ -313,7 +313,16 @@ type Func = {
 };
 // decl: 이 이름을 만든 선언문. goto 로 그 앞으로 돌아가면 이름을 지운다
 // missing: extern 으로 선언만 하고 정의는 없는 전역. sizeof 는 되고 값을 쓰면 오류(진짜 C 의 링크 오류)
-type Binding = { addr: number; type: CType; decl?: Node; missing?: true };
+// kind: 블록 안에서 만든 typedef·struct 태그("struct s" 처럼 공백 든 이름이라 변수와 안 겹친다)·enum 상수.
+// 변수와 같은 이름 범위에 두어 블록을 나가면 사라지고 안쪽 것이 바깥 것을 가린다
+type Binding = {
+  addr: number;
+  type: CType;
+  decl?: Node;
+  missing?: true;
+  kind?: "typedef" | "tag" | "enum";
+  value?: number;
+};
 
 const hex = (v: number) => `0x${v.toString(16)}`;
 
@@ -602,6 +611,8 @@ export function run(
         );
       }
       case "type_identifier": {
+        const local = findScoped(node.text);
+        if (local?.kind === "typedef") return local.type;
         const std = STD_TYPES[node.text];
         if (std) return std;
         return (
@@ -617,11 +628,12 @@ export function run(
           `(익명)${node.row}:${node.text.length}`;
         const body = node.childForFieldName("body");
         const key = `${union ? "union" : "struct"} ${name}`;
-        let st = structs.get(key);
-        if (!st) {
-          st = { k: "struct", name, union, fields: null, size: 0, align: 1 };
-          structs.set(key, st);
-        }
+        const scope = frame()?.scopes.at(-1);
+        let st =
+          (findScoped(key)?.type as StructType | undefined) ?? structs.get(key);
+        // 처음 보는 태그거나, 바깥에 있는 태그를 이 블록에서 다시 정의하면 새 타입
+        if (!st || (body && !(scope ? scope.has(key) : structs.has(key))))
+          st = newTag(key, name, union);
         if (body) defineStruct(st, body);
         return st;
       }
@@ -633,7 +645,16 @@ export function run(
             if (!e || e.type !== "enumerator") continue;
             const v = e.childForFieldName("value");
             if (v) next = constEval(v);
-            enums.set(field(e, "name").text, next++);
+            const scope = frame()?.scopes.at(-1);
+            const name = field(e, "name").text;
+            if (scope)
+              scope.set(name, {
+                addr: 0,
+                type: T.int,
+                kind: "enum",
+                value: next++,
+              });
+            else enums.set(name, next++);
           }
         }
         return T.int;
@@ -641,6 +662,29 @@ export function run(
       default:
         return fail(node, `지원하지 않는 타입 ${node.type}`);
     }
+  };
+  const findScoped = (name: string): Binding | undefined => {
+    const f = frame();
+    if (f)
+      for (let i = f.scopes.length - 1; i >= 0; i--) {
+        const v = f.scopes[i].get(name);
+        if (v) return v;
+      }
+  };
+  // 태그를 지금 블록(함수 밖이면 전역)에 새로 만든다
+  const newTag = (key: string, name: string, union: boolean) => {
+    const st: StructType = {
+      k: "struct",
+      name,
+      union,
+      fields: null,
+      size: 0,
+      align: 1,
+    };
+    const scope = frame()?.scopes.at(-1);
+    if (scope) scope.set(key, { addr: 0, type: st, kind: "tag" });
+    else structs.set(key, st);
+    return st;
   };
   const defineStruct = (st: StructType, body: Node) => {
     const fields: Field[] = [];
@@ -1143,7 +1187,10 @@ export function run(
         return { t: T.int, v: 0 };
       case "identifier": {
         const name = n.text;
-        const e = enums.get(name);
+        const local = findScoped(name);
+        if (local?.kind === "enum") return { t: T.int, v: local.value ?? 0 };
+        if (local?.kind === "typedef") return { t: local.type, v: 0 };
+        const e = local ? undefined : enums.get(name);
         if (e !== undefined) return { t: T.int, v: e };
         const fn = funcs.get(name);
         if (fn && !lookupMaybe(name)) return { t: fn.type, v: fn.addr };
@@ -1344,6 +1391,7 @@ export function run(
     const name = base.text;
     if (
       base.type === "type_identifier" &&
+      findScoped(name)?.kind !== "typedef" &&
       !typedefs.has(name) &&
       !STD_TYPES[name] &&
       (funcs.has(name) || lookupMaybe(name))
@@ -2030,14 +2078,15 @@ export function run(
   const vars = (scopes: Map<string, Binding>[]) => {
     const list: CVar[] = [];
     for (const s of scopes)
-      for (const [name, { addr, type }] of s)
-        list.push({
-          name,
-          type: typeName(type),
-          addr,
-          size: type.size,
-          value: show(type, addr),
-        });
+      for (const [name, { addr, type, kind }] of s)
+        if (!kind)
+          list.push({
+            name,
+            type: typeName(type),
+            addr,
+            size: type.size,
+            value: show(type, addr),
+          });
     return list;
   };
   const record = (n: Node) => {
@@ -2155,14 +2204,23 @@ export function run(
     n.namedChildren.filter((c) => c.type !== "comment");
 
   // 건너뛴 문장 안에서 이 블록에 이름을 만드는 선언(case·레이블은 블록이 아니라 그 안의 선언도 이 블록 것)
+  const TYPE_DECLS = new Set([
+    "type_definition",
+    "struct_specifier",
+    "union_specifier",
+    "enum_specifier",
+  ]);
   const skipped = (k: Node): Node[] =>
-    k.type === "declaration"
+    k.type === "declaration" || TYPE_DECLS.has(k.type)
       ? [k]
       : k.type === "case_statement"
         ? caseBody(k).flatMap(skipped)
         : k.type === "labeled_statement"
           ? skipped(labeled(k))
           : [];
+  // 건너뛴 선언: 변수는 이름과 자리만, 타입 선언은 그대로
+  const skipDecl = (k: Node) =>
+    k.type === "declaration" ? declareLocal(k, false) : exec(k);
   const declaredHere = (scope: Map<string, Binding>, k: Node) =>
     [...scope.values()].some((b) => b.decl === k);
   function runBlock(n: Node, start: string | null) {
@@ -2182,7 +2240,7 @@ export function run(
               if (b.decl && kids.indexOf(b.decl) >= at) scope.delete(name);
             // 건너뛴 선언도 그 블록 안에선 이름이 있다
             for (const k of kids.slice(0, at).flatMap(skipped))
-              if (!declaredHere(scope, k)) declareLocal(k, false);
+              if (!declaredHere(scope, k)) skipDecl(k);
             target = null;
             i = at + 1;
             resume(kids[at], label);
@@ -2213,8 +2271,7 @@ export function run(
           return;
         }
         const at = kids.findIndex((k) => labelsOf(k).has(label));
-        for (const k of kids.slice(0, at).flatMap(skipped))
-          declareLocal(k, false);
+        for (const k of kids.slice(0, at).flatMap(skipped)) skipDecl(k);
         resume(kids[at], label);
         for (const k of kids.slice(at + 1)) exec(k);
         return;
@@ -2306,9 +2363,22 @@ export function run(
         record(n);
         declareLocal(n);
         return;
-      case "type_definition":
       case "struct_specifier":
-      case "union_specifier":
+      case "union_specifier": {
+        // struct s; 만 쓰면 바깥의 같은 태그를 가리고 이 블록에 새 태그를 만든다
+        const name = n.childForFieldName("name")?.text;
+        const union = n.type === "union_specifier";
+        const key = `${union ? "union" : "struct"} ${name}`;
+        if (
+          name &&
+          !n.childForFieldName("body") &&
+          !frame().scopes.at(-1)?.has(key)
+        )
+          newTag(key, name, union);
+        else typeOf(n);
+        return;
+      }
+      case "type_definition":
       case "enum_specifier":
         topLevel(n);
         return;
@@ -2398,7 +2468,9 @@ export function run(
         for (const d of top.childrenForFieldName("declarator")) {
           if (!d) continue;
           const { name, type } = declare(b, d);
-          typedefs.set(name, type);
+          const scope = frame()?.scopes.at(-1);
+          if (scope) scope.set(name, { addr: 0, type, kind: "typedef" });
+          else typedefs.set(name, type);
         }
         return;
       }
@@ -2462,11 +2534,17 @@ export function run(
           if (type.k === "array" && !type.n && init)
             type = arr(type.of, initCount(init));
           // 같은 전역을 여러 번 선언할 수 있다(extern int a; int a = 1;). 크기가 정해지는 선언에서 자리를 잡는다
-          if (!defined.has(name)) {
-            globals.set(name, { addr: 0, type, missing: true });
+          // 정의가 없거나, 아직 크기를 모르는 struct 의 extern 선언은 자리를 정의에서 잡는다
+          if (
+            !defined.has(name) ||
+            (storage(top, "extern") && !init && !type.size)
+          ) {
+            if (!globals.has(name))
+              globals.set(name, { addr: 0, type, missing: true });
             continue;
           }
-          const known = globals.get(name);
+          const seen = globals.get(name);
+          const known = seen?.missing ? undefined : seen;
           const addr =
             known && known.type.size >= type.size
               ? known.addr
