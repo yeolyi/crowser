@@ -39,7 +39,7 @@ npm install @yeolyi/crowser
 ## Quick start
 
 ```ts
-import { run } from "@yeolyi/crowser";
+import { replay, run } from "@yeolyi/crowser";
 
 const { out, steps, error } = run(`
 #include <stdio.h>
@@ -51,7 +51,10 @@ int main(void) {
 
 out;          // "1\n2\n3\n"
 error;        // { line: 4, msg: "배열 a[3]의 범위 밖 인덱스 3입니다" } (index 3 is out of range for a[3])
-steps.length; // 10: one snapshot per executed line
+steps.length; // 10: one per executed line
+
+const trace = replay(steps);
+trace.at(3);  // { line, frames, globals, heap, out } at step 3
 ```
 
 In the browser, use the worker build so long programs never block the UI:
@@ -72,11 +75,11 @@ No bundler setup is needed: the worker is inlined into the package.
 | Option  | Default | Description                                                                                                  |
 | ------- | ------- | ------------------------------------------------------------------------------------------------------------ |
 | `limit` | `3000`  | Steps to record. Past this, recording stops but the program still runs to the end. `0` = no recording, fastest. |
-| `ops`   | `2e7`   | Budget before the program is treated as an infinite loop.                                                    |
+| `ops`   | `2e7`   | Infinite-loop guard: interpreter steps while recording. The fast pass allows 25× that in loop iterations and calls. |
 
 ```ts
 type CResult = {
-  steps: CStep[];          // one per executed line
+  steps: CChange[];        // what changed at each executed line
   out: string;             // stdout + stderr
   exit: number;            // return value of main / exit()
   error: { line: number | null; msg: string } | null;
@@ -84,6 +87,17 @@ type CResult = {
   leaked: number;          // heap blocks never freed
 };
 
+// Only what changed is stored, so 20,000 steps of a 300-node linked list is ~4.5 MB.
+type CChange = {
+  line: number;
+  depth?: number;                    // new call-stack depth
+  frames?: [number, CFrame][];       // frames that changed: [index, frame]
+  globals?: CVar[];                  // globals that changed
+  heap?: CBlock[];                   // blocks allocated, written or freed
+  out?: string;                      // output printed at this step
+};
+
+// replay(steps).at(i) rebuilds the full picture of step i
 type CStep = {
   line: number;            // 0-based line about to run
   frames: { func: string; vars: CVar[] }[];   // main → current function
@@ -94,6 +108,10 @@ type CStep = {
 
 type CVar = { name: string; type: string; addr: number; size: number; value: string };
 ```
+
+### `replay(steps) → { length, at(i): CStep }`
+
+Rebuilds any step from the changes. Keeps a full picture every 128 steps, so `at(i)` is fast in any order.
 
 ### `runC(source, limit = 2000) → Promise<CResult & { seconds }>` · `releaseC()`
 

@@ -4,11 +4,11 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { chromium } from "playwright";
-import { type CStep, run } from "../../src/index.ts";
+import { type CStep, replay, run } from "../../src/index.ts";
 
 const dir = import.meta.dirname;
 const src = fs.readFileSync(path.join(dir, "demo.c"), "utf8");
-const { steps } = run(src);
+const steps = replay(run(src).steps);
 const lines = src.trimEnd().split("\n");
 
 const esc = (s: string) =>
@@ -74,8 +74,8 @@ h3 { font: 600 11px -apple-system, sans-serif; letter-spacing: .08em; text-trans
 const tmp = fs.mkdtempSync(path.join(dir, ".frames-"));
 const browser = await chromium.launch();
 const p = await browser.newPage({ viewport: { width: 1100, height: 760 } });
-for (const [i, s] of steps.entries()) {
-  await p.setContent(page(s, i));
+for (let i = 0; i < steps.length; i++) {
+  await p.setContent(page(steps.at(i), i));
   await p.screenshot({ path: path.join(tmp, `${String(i).padStart(3, "0")}.png`) });
 }
 await browser.close();

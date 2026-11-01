@@ -413,6 +413,7 @@ type Block = {
   freed: boolean;
   ctype: CType | null;
 };
+/** 한 단계의 모습. replay(steps).at(i) 로 얻는다 */
 export type CStep = {
   /** 이제 실행할 줄(0부터) */
   line: number;
@@ -420,11 +421,27 @@ export type CStep = {
   frames: CFrame[];
   globals: CVar[];
   heap: CBlock[];
+  /** 그때까지의 출력 */
   out: string;
+};
+/** 한 단계에서 바뀐 것만. 첫 단계는 처음 모습 전체다 */
+export type CChange = {
+  line: number;
+  /** 함수 칸 수가 바뀌었으면 새 수 */
+  depth?: number;
+  /** 내용이 바뀌거나 새로 생긴 함수 칸: [몇 번째, 그 칸] */
+  frames?: [number, CFrame][];
+  /** 새로 생기거나 값이 바뀐 전역 변수(이름과 주소로 가린다) */
+  globals?: CVar[];
+  /** 새로 생기거나 바뀐 힙 블록(주소로 가린다. 블록은 사라지지 않고 freed 만 바뀐다) */
+  heap?: CBlock[];
+  /** 이 단계에 새로 나온 출력 */
+  out?: string;
 };
 export type CError = { line: number | null; msg: string };
 export type CResult = {
-  steps: CStep[];
+  /** 단계마다 바뀐 것. 그 단계의 모습은 replay(steps).at(i) */
+  steps: CChange[];
   out: string;
   error: CError | null;
   exit: number;
@@ -653,7 +670,7 @@ function execute(
     va?: number;
     slots: Map<Node, number>;
   }[] = [];
-  const steps: CStep[] = [];
+  const steps: CChange[] = [];
   let out = "";
   let seed = 1;
   const began = performance.now();
@@ -4030,46 +4047,114 @@ function execute(
       return "?";
     }
   };
+  // 값 글은 그 자리의 바이트가 그대로면 지난번 것을 다시 쓴다(단계마다 모든 변수·블록을 다시 읽지 않게).
+  // show 가 읽는 바이트: 배열은 앞 20개(char 배열은 전부), 나머지는 크기만큼
+  const shown = new Map<number, { name: string; bytes: Uint8Array; value: string }>();
+  const span = (t: CType) =>
+    t.k === "array" && !(t.of.k === "int" && t.of.name === T.char.name)
+      ? Math.min(t.size, 20 * t.of.size)
+      : t.size;
+  const showAt = (t: CType, addr: number, name: string) => {
+    const n = span(t);
+    if (addr <= 0 || addr + n > MEM_SIZE) return show(t, addr);
+    const now = new Uint8Array(mem.buffer, addr, n);
+    const c = shown.get(addr);
+    if (c && c.name === name && c.bytes.length === n) {
+      let same = true;
+      for (let i = 0; i < n; i++)
+        if (c.bytes[i] !== now[i]) {
+          same = false;
+          break;
+        }
+      if (same) return c.value;
+    }
+    const value = show(t, addr);
+    shown.set(addr, { name, bytes: now.slice(), value });
+    return value;
+  };
   const block = (h: Block): CBlock => {
     let t = h.ctype;
     // malloc(n * sizeof(int)) 처럼 원소 여러 개면 배열로 읽는다
     if (t && t.size > 0 && h.size > t.size && h.size % t.size === 0)
       t = arr(t, h.size / t.size);
+    const type = t ? typeName(t) : null;
     return {
       addr: h.addr,
       size: h.size,
       freed: h.freed,
-      type: t ? typeName(t) : null,
-      value: t && !h.freed ? show(t, h.addr) : null,
+      type,
+      value: t && type && !h.freed ? showAt(t, h.addr, type) : null,
     };
   };
   const vars = (scopes: Map<string, Binding>[]) => {
     const list: CVar[] = [];
     for (const s of scopes)
       for (const [name, { addr, type, kind }] of s)
-        if (!kind)
+        if (!kind) {
+          const t = typeName(type);
           list.push({
             name,
-            type: typeName(type),
+            type: t,
             addr,
             size: type.size,
-            value: show(type, addr),
+            value: showAt(type, addr, t),
           });
+        }
     return list;
   };
+  const sameVar = (a: CVar, b: CVar) =>
+    a.name === b.name &&
+    a.addr === b.addr &&
+    a.value === b.value &&
+    a.type === b.type;
+  const sameFrame = (a: CFrame, b: CFrame | undefined) =>
+    !!b &&
+    a.func === b.func &&
+    a.vars.length === b.vars.length &&
+    a.vars.every((v, i) => sameVar(v, b.vars[i]));
+  const sameBlock = (a: CBlock, b: CBlock | undefined) =>
+    !!b &&
+    a.freed === b.freed &&
+    a.type === b.type &&
+    a.value === b.value;
+  // 지난 단계의 모습. 바뀐 것만 담으려고 견준다
+  let last: Omit<CStep, "line" | "out"> = { frames: [], globals: [], heap: [] };
+  let outSent = 0;
+  const outText = new TextDecoder();
   const record = (n: Node) => {
     if (steps.length >= limit) {
       truncated = true;
       if (limit > 0) throw new Stop();
       return;
     }
-    steps.push({
-      line: lineOf(n),
+    const now = {
       frames: frames.map((f) => ({ func: f.name, vars: vars(f.scopes) })),
       globals: vars([globals]),
       heap: heap.map(block),
-      out: text(out),
-    });
+    };
+    const c: CChange = { line: lineOf(n) };
+    if (now.frames.length !== last.frames.length || !steps.length)
+      c.depth = now.frames.length;
+    const fs = now.frames.flatMap((f, i): [number, CFrame][] =>
+      sameFrame(f, last.frames[i]) ? [] : [[i, f]],
+    );
+    if (fs.length) c.frames = fs;
+    const old = new Map(last.globals.map((v) => [`${v.name}@${v.addr}`, v]));
+    const gs = now.globals.filter(
+      (v) => !((o) => o && sameVar(v, o))(old.get(`${v.name}@${v.addr}`)),
+    );
+    if (gs.length) c.globals = gs;
+    const hs = now.heap.filter((b, i) => !sameBlock(b, last.heap[i]));
+    if (hs.length) c.heap = hs;
+    if (out.length > outSent) {
+      const bytes = Uint8Array.from(out.slice(outSent), (x) => x.charCodeAt(0));
+      // 글자 하나의 UTF-8 바이트가 두 단계에 걸치면 다 모인 단계에 낸다
+      const t = outText.decode(bytes, { stream: true });
+      if (t) c.out = t;
+      outSent = out.length;
+    }
+    steps.push(c);
+    last = now;
   };
 
   // --- 문장 ---

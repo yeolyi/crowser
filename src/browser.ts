@@ -4,6 +4,7 @@ import type { ToWorker } from "./worker.ts";
 import { workerUrl } from "./worker-url.ts";
 
 export * from "./interp.ts";
+export * from "./replay.ts";
 
 export type CRun = Omit<CResult, "read"> & {
   /** 해석기가 돈 시간(진짜 C 보다 훨씬 느리다) */

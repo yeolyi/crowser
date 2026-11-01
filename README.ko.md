@@ -39,7 +39,7 @@ npm install @yeolyi/crowser
 ## 빠른 시작
 
 ```ts
-import { run } from "@yeolyi/crowser";
+import { replay, run } from "@yeolyi/crowser";
 
 const { out, steps, error } = run(`
 #include <stdio.h>
@@ -52,6 +52,9 @@ int main(void) {
 out;          // "1\n2\n3\n"
 error;        // { line: 4, msg: "배열 a[3]의 범위 밖 인덱스 3입니다" }
 steps.length; // 10: 실행한 줄마다 하나씩
+
+const trace = replay(steps);
+trace.at(3);  // 3번째 단계의 { line, frames, globals, heap, out }
 ```
 
 브라우저에선 워커 판을 쓰면 오래 도는 프로그램도 화면을 멈추지 않습니다.
@@ -72,11 +75,11 @@ releaseC();                      // 다 쓰면 워커를 내린다
 | 옵션    | 기본값 | 설명                                                                                  |
 | ------- | ------ | ------------------------------------------------------------------------------------- |
 | `limit` | `3000` | 기록할 단계 수. 넘으면 기록만 그치고 프로그램은 끝까지 돕니다. `0`은 기록 없이 가장 빠르게. |
-| `ops`   | `2e7`  | 이만큼 돌면 끝나지 않는 반복으로 보고 멈춥니다.                                         |
+| `ops`   | `2e7`  | 끝나지 않는 반복 막기. 기록하며 돌 때 해석기 연산 수. 빠른 실행은 그 25배만큼 반복·호출을 허용합니다. |
 
 ```ts
 type CResult = {
-  steps: CStep[];          // 실행한 줄마다 하나
+  steps: CChange[];        // 실행한 줄마다 바뀐 것
   out: string;             // stdout + stderr
   exit: number;            // main 의 반환값 / exit()
   error: { line: number | null; msg: string } | null;
@@ -84,6 +87,17 @@ type CResult = {
   leaked: number;          // free 하지 않은 힙 블록 수
 };
 
+// 바뀐 것만 담아서, 노드 300개짜리 연결 리스트를 2만 단계 기록해도 약 4.5MB
+type CChange = {
+  line: number;
+  depth?: number;                    // 바뀐 호출 깊이
+  frames?: [number, CFrame][];       // 바뀐 함수 칸: [몇 번째, 칸]
+  globals?: CVar[];                  // 바뀐 전역 변수
+  heap?: CBlock[];                   // 새로 받거나, 쓰거나, free 한 블록
+  out?: string;                      // 이 단계에 찍힌 출력
+};
+
+// replay(steps).at(i) 가 i 번째 단계의 모습을 다시 만든다
 type CStep = {
   line: number;            // 이제 실행할 줄(0부터)
   frames: { func: string; vars: CVar[] }[];   // main → 지금 함수
@@ -94,6 +108,10 @@ type CStep = {
 
 type CVar = { name: string; type: string; addr: number; size: number; value: string };
 ```
+
+### `replay(steps) → { length, at(i): CStep }`
+
+바뀐 것에서 아무 단계의 모습을 다시 만듭니다. 128단계마다 전체 모습을 남겨 두어 어느 순서로 `at(i)`을 불러도 빠릅니다.
 
 ### `runC(source, limit = 2000) → Promise<CResult & { seconds }>` · `releaseC()`
 
