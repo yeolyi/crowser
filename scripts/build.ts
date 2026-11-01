@@ -1,4 +1,4 @@
-// dist 만들기: 진입점 두 개(index·browser)를 묶고, 워커는 한 파일로 묶어 browser 안에 문자열로 넣는다
+// dist 만들기: 진입점 셋(index·browser·syntax)를 묶고, 워커는 한 파일로 묶어 browser 안에 문자열로 넣는다
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
 import { build } from "esbuild";
@@ -15,7 +15,7 @@ const worker = await build({
 const code = worker.outputFiles[0].text;
 
 await build({
-  entryPoints: ["src/index.ts", "src/browser.ts"],
+  entryPoints: ["src/index.ts", "src/browser.ts", "src/syntax.ts"],
   outdir: "dist",
   bundle: true,
   splitting: true,

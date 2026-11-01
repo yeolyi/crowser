@@ -26,7 +26,7 @@ C17 코드를 브라우저에서 돌리면서 줄마다 스택과 힙을 기록�
 
 - **모든 단계를 기록합니다.** 지금 줄, 함수마다의 변수, `malloc` 한 블록과 그 내용, 그때까지의 출력.
 - **실수한 줄에서 멈춥니다.** 배열 밖 인덱스, `NULL` 따라가기, free 뒤 사용, 두 번 free, 0으로 나누기를 그 줄에서 알립니다.
-- **진짜 C17입니다.** 전처리기, 파서, 타입 검사를 직접 만들었습니다. GCC torture, c-testsuite, *Writing a C Compiler* 시험을 모두 통과합니다.
+- **진짜 C17입니다.** 전처리기, 파서, 타입 검사를 직접 만들었습니다. GCC torture, c-testsuite, _Writing a C Compiler_ 시험을 모두 통과합니다.
 - **충분히 빠릅니다.** 함수를 처음 부를 때 JavaScript로 옮겨 돌립니다. 반복 1억 번에 약 0.3초.
 - **의존성이 없습니다.** 순수 TypeScript. 브라우저에선 Web Worker에서, Node에선 동기로 돕니다.
 
@@ -49,12 +49,12 @@ int main(void) {
 }
 `);
 
-out;          // "1\n2\n3\n"
-error;        // { line: 4, msg: "배열 a[3]의 범위 밖 인덱스 3입니다" }
+out; // "1\n2\n3\n"
+error; // { line: 4, msg: "배열 a[3]의 범위 밖 인덱스 3입니다" }
 steps.length; // 10: 실행한 줄마다 하나씩
 
 const trace = replay(steps);
-trace.at(3);  // 3번째 단계의 { line, frames, globals, heap, out }
+trace.at(3); // 3번째 단계의 { line, frames, globals, heap, out }
 ```
 
 브라우저에선 워커 판을 쓰면 오래 도는 프로그램도 화면을 멈추지 않습니다.
@@ -63,7 +63,7 @@ trace.at(3);  // 3번째 단계의 { line, frames, globals, heap, out }
 import { runC, releaseC } from "@yeolyi/crowser/browser";
 
 const result = await runC(code, { limit: 20000 }); // Web Worker 에서 돈다
-releaseC();                      // 다 쓰면 워커를 내린다
+releaseC(); // 다 쓰면 워커를 내린다
 ```
 
 워커가 패키지 안에 들어 있어 번들러 설정이 필요 없습니다.
@@ -72,42 +72,54 @@ releaseC();                      // 다 쓰면 워커를 내린다
 
 ### `run(source, options?) → CResult`
 
-| 옵션    | 기본값 | 설명                                                                                  |
-| ------- | ------ | ------------------------------------------------------------------------------------- |
-| `limit` | `3000` | 기록할 단계 수. 넘으면 기록만 그치고 프로그램은 끝까지 돕니다. `0`은 기록 없이 가장 빠르게. |
-| `ops`   | `2e7`  | 끝나지 않는 반복 막기. 기록하며 돌 때 해석기 연산 수. 빠른 실행은 그 25배만큼 반복·호출을 허용합니다. `Infinity`면 멈추지 않습니다(`runC`의 `signal`로 끊습니다). |
-| `finish` | `true` | 기록이 `limit`에 닿으면 기록 없이 다시 돌려 마지막 출력을 얻습니다. `false`면 `limit`에서 그쳐, 끝나지 않는 반복도 멈춥니다. |
+| 옵션     | 기본값 | 설명                                                                                                                                                              |
+| -------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `limit`  | `3000` | 기록할 단계 수. 넘으면 기록만 그치고 프로그램은 끝까지 돕니다. `0`은 기록 없이 가장 빠르게.                                                                       |
+| `ops`    | `2e7`  | 끝나지 않는 반복 막기. 기록하며 돌 때 해석기 연산 수. 빠른 실행은 그 25배만큼 반복·호출을 허용합니다. `Infinity`면 멈추지 않습니다(`runC`의 `signal`로 끊습니다). |
+| `finish` | `true` | 기록이 `limit`에 닿으면 기록 없이 다시 돌려 마지막 출력을 얻습니다. `false`면 `limit`에서 그쳐, 끝나지 않는 반복도 멈춥니다.                                      |
 
 ```ts
 type CResult = {
-  steps: CChange[];        // 실행한 줄마다 바뀐 것
-  out: string;             // stdout + stderr
-  exit: number;            // main 의 반환값 / exit()
+  steps: CChange[]; // 실행한 줄마다 바뀐 것
+  out: string; // stdout + stderr
+  exit: number; // main 의 반환값 / exit()
   error: { line: number | null; msg: string } | null;
-  truncated: boolean;      // limit 보다 단계가 많았다
-  leaked: number;          // free 하지 않은 힙 블록 수
+  truncated: boolean; // limit 보다 단계가 많았다
+  leaked: number; // free 하지 않은 힙 블록 수
 };
 
 // 바뀐 것만 담아서, 노드 300개짜리 연결 리스트를 2만 단계 기록해도 약 4.5MB
 type CChange = {
   line: number;
-  depth?: number;                    // 바뀐 호출 깊이
-  frames?: [number, CFrame][];       // 바뀐 함수 칸: [몇 번째, 칸]
-  globals?: CVar[];                  // 바뀐 전역 변수
-  heap?: CBlock[];                   // 새로 받거나, 쓰거나, free 한 블록
-  out?: string;                      // 이 단계에 찍힌 출력
+  depth?: number; // 바뀐 호출 깊이
+  frames?: [number, CFrame][]; // 바뀐 함수 칸: [몇 번째, 칸]
+  globals?: CVar[]; // 바뀐 전역 변수
+  heap?: CBlock[]; // 새로 받거나, 쓰거나, free 한 블록
+  out?: string; // 이 단계에 찍힌 출력
 };
 
 // replay(steps).at(i) 가 i 번째 단계의 모습을 다시 만든다
 type CStep = {
-  line: number;            // 이제 실행할 줄(0부터)
-  frames: { func: string; vars: CVar[] }[];   // main → 지금 함수
+  line: number; // 이제 실행할 줄(0부터)
+  frames: { func: string; vars: CVar[] }[]; // main → 지금 함수
   globals: CVar[];
-  heap: { addr: number; size: number; freed: boolean; type: string | null; value: string | null }[];
-  out: string;             // 그때까지의 출력
+  heap: {
+    addr: number;
+    size: number;
+    freed: boolean;
+    type: string | null;
+    value: string | null;
+  }[];
+  out: string; // 그때까지의 출력
 };
 
-type CVar = { name: string; type: string; addr: number; size: number; value: string };
+type CVar = {
+  name: string;
+  type: string;
+  addr: number;
+  size: number;
+  value: string;
+};
 ```
 
 ### `replay(steps) → { length, at(i): CStep }`
@@ -118,30 +130,34 @@ type CVar = { name: string; type: string; addr: number; size: number; value: str
 
 `run`과 같고 Web Worker 안에서 돕니다(`@yeolyi/crowser/browser`). `signal`로 그만두면 그 실행이 돌고 있던 워커를 내려, 끝나지 않는 반복도 바로 멈춥니다. 기다리던 다른 실행은 새 워커에서 이어 돕니다.
 
+### `parseC(source) → { root, error }`
+
+타입 검사나 실행 없이 전처리하고 문법 나무만 만듭니다(`@yeolyi/crowser/syntax`). `root`의 노드 종류와 필드 이름은 tree-sitter-c와 같고(`function_definition`, `declarator` …), `error`는 `run`과 같은 말의 `{ line, msg }`입니다. 교육용 컴파일러처럼 crowser와 같은 방식으로 C를 읽어야 하는 도구에 씁니다.
+
 ## 잡아 주는 실수
 
-| 실수                                 | 진짜 C           | crowser                  |
-| ------------------------------------ | ---------------- | ------------------------ |
-| `int a[3]`에 `a[3]`                  | 조용히 망가짐    | 그 줄에서 멈춤           |
-| `malloc` 블록 밖 읽기·쓰기           | 조용히 망가짐    | 그 줄에서 멈춤           |
-| `NULL` 따라가기                      | 세그폴트         | 그 줄에서 멈춤           |
-| `free` 뒤 사용                       | 정의되지 않음    | 그 줄에서 멈춤           |
-| 두 번 `free` / 힙이 아닌 주소 `free` | 언젠가 죽음      | 그 줄에서 멈춤           |
-| 0으로 나누기                         | 죽음             | 그 줄에서 멈춤           |
-| 끝나지 않는 반복                     | 멈추지 않음      | 연산 한도에서 멈춤       |
-| 타입 오류, `const` 위반, 선언 안 한 이름 | 컴파일 오류  | 실행 전에 컴파일 오류    |
+| 실수                                     | 진짜 C        | crowser               |
+| ---------------------------------------- | ------------- | --------------------- |
+| `int a[3]`에 `a[3]`                      | 조용히 망가짐 | 그 줄에서 멈춤        |
+| `malloc` 블록 밖 읽기·쓰기               | 조용히 망가짐 | 그 줄에서 멈춤        |
+| `NULL` 따라가기                          | 세그폴트      | 그 줄에서 멈춤        |
+| `free` 뒤 사용                           | 정의되지 않음 | 그 줄에서 멈춤        |
+| 두 번 `free` / 힙이 아닌 주소 `free`     | 언젠가 죽음   | 그 줄에서 멈춤        |
+| 0으로 나누기                             | 죽음          | 그 줄에서 멈춤        |
+| 끝나지 않는 반복                         | 멈추지 않음   | 연산 한도에서 멈춤    |
+| 타입 오류, `const` 위반, 선언 안 한 이름 | 컴파일 오류   | 실행 전에 컴파일 오류 |
 
 ## 표준 적합성
 
 기준은 **clang `-std=c17 -pedantic-errors`, 64비트**입니다. clang이 받지 않는 프로그램, clang 검사기(sanitizer)에서 정의되지 않은 동작이 나오는 프로그램, crowser가 빼 둔 C17 선택 기능을 쓰는 시험은 셈에서 뺍니다.
 
-| 시험 모음                                                                              | 통과            |
-| -------------------------------------------------------------------------------------- | --------------- |
-| [GCC torture](https://github.com/gcc-mirror/gcc/tree/master/gcc/testsuite/gcc.c-torture/execute) (execute) | **870 / 870**   |
-| [c-testsuite](https://github.com/c-testsuite/c-testsuite)                              | **207 / 207**   |
-| [Writing a C Compiler](https://github.com/nlsandler/writing-a-c-compiler-tests) (올바른 프로그램) | **718 / 718**   |
-| Writing a C Compiler (잘못된 프로그램 거부)                                            | **692 / 692**   |
-| [Csmith](https://github.com/csmith-project/csmith) 무작위 프로그램, clang과 체크섬 대조 | **365 / 365**   |
+| 시험 모음                                                                                                  | 통과          |
+| ---------------------------------------------------------------------------------------------------------- | ------------- |
+| [GCC torture](https://github.com/gcc-mirror/gcc/tree/master/gcc/testsuite/gcc.c-torture/execute) (execute) | **870 / 870** |
+| [c-testsuite](https://github.com/c-testsuite/c-testsuite)                                                  | **207 / 207** |
+| [Writing a C Compiler](https://github.com/nlsandler/writing-a-c-compiler-tests) (올바른 프로그램)          | **718 / 718** |
+| Writing a C Compiler (잘못된 프로그램 거부)                                                                | **692 / 692** |
+| [Csmith](https://github.com/csmith-project/csmith) 무작위 프로그램, clang과 체크섬 대조                    | **365 / 365** |
 
 ```sh
 pnpm test          # 예제를 clang 출력과 대조, 오류 줄 시험
@@ -151,10 +167,10 @@ pnpm fuzz 1 100    # Csmith 씨앗 1~100 을 clang과 대조(brew install csmith
 
 ## 속도
 
-| 프로그램                       | crowser | `clang -O0` |
-| ------------------------------ | ------- | ----------- |
-| 반복 1억 번                    | 0.34초  | 0.09초      |
-| 범위 검사하는 배열 갱신 1천만 번 | 0.15초 | —           |
+| 프로그램                         | crowser | `clang -O0` |
+| -------------------------------- | ------- | ----------- |
+| 반복 1억 번                      | 0.34초  | 0.09초      |
+| 범위 검사하는 배열 갱신 1천만 번 | 0.15초  | —           |
 
 느린 건 기록입니다. 앞의 `limit` 단계는 해석기로 기록하고, 마지막 출력은 기록 없이 다시 돌려 얻습니다.
 
