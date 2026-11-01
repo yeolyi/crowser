@@ -222,14 +222,38 @@ export function preprocess(src: string): {
     lines.push(line, ...Array<string>(extra).fill(""));
   }
 
+  // #line 이 바꾼 줄 번호(__LINE__ 에 더할 값)와 파일 이름
+  let lineShift = 0;
+  let fileName = '"main.c"';
   // 매크로를 펼친다. hide 는 지금 펼치는 중인 이름(자기 자신을 다시 펼치지 않게)
   const expand = (
-    text: string,
+    input: string,
     line: number,
     hide: Set<string> = new Set(),
   ): string => {
+    let text = input;
     let out = "";
     let i = 0;
+    // 펼친 결과를 내보내고 at 부터 이어 읽는다. 결과가 함수 꼴 매크로 이름으로 끝나고 뒤에 ( 가 오면
+    // 표준대로 뒤 글과 이어서 다시 읽는다(CAT(A,B)(x) 가 AB(x) 가 되어 다시 펼쳐진다)
+    const emit = (res: string, at: number, self: string) => {
+      const tail = /([A-Za-z_]\w*)\s*$/.exec(res);
+      const g = tail ? macros.get(tail[1]) : undefined;
+      if (
+        tail &&
+        g?.params &&
+        tail[1] !== self &&
+        !hide.has(tail[1]) &&
+        /^\s*\(/.test(text.slice(at))
+      ) {
+        out += ` ${res.slice(0, tail.index)}`;
+        text = tail[1] + text.slice(at);
+        i = 0;
+        return;
+      }
+      out += ` ${res} `;
+      i = at;
+    };
     while (i < text.length) {
       const c = text[i];
       if (c === '"' || c === "'") {
@@ -254,7 +278,7 @@ export function preprocess(src: string): {
       while (j < text.length && isId(text[j])) j++;
       const name = text.slice(i, j);
       if (name === "__LINE__" || name === "__FILE__") {
-        out += name === "__LINE__" ? String(line + 1) : '"main.c"';
+        out += name === "__LINE__" ? String(line + 1 + lineShift) : fileName;
         i = j;
         continue;
       }
@@ -268,8 +292,7 @@ export function preprocess(src: string): {
       }
       // 펼친 결과는 앞뒤와 띄운다. 붙이면 0x1E 와 +1 이 0x1E+1 처럼 한 토큰으로 읽힌다
       if (m.params === null) {
-        out += ` ${expand(m.body, line, new Set([...hide, name]))} `;
-        i = j;
+        emit(expand(m.body, line, new Set([...hide, name])), j, name);
         continue;
       }
       // 함수 꼴 매크로: 이름 뒤에 ( 가 와야 부른 것이다
@@ -320,12 +343,15 @@ export function preprocess(src: string): {
         m.params.slice(0, fixed).map((p, x) => [p, args[x]]),
       );
       if (variadic) bind.set("__VA_ARGS__", args.slice(fixed).join(", "));
-      out += ` ${expand(
-        substitute(m.body, bind, (a) => expand(a, line, hide)),
-        line,
-        new Set([...hide, name]),
-      )} `;
-      i = k + 1;
+      emit(
+        expand(
+          substitute(m.body, bind, (a) => expand(a, line, hide)),
+          line,
+          new Set([...hide, name]),
+        ),
+        k + 1,
+        name,
+      );
     }
     return out;
   };
@@ -451,7 +477,17 @@ export function preprocess(src: string): {
                 `지원하지 않는 헤더 ${rest.trim()}(표준 헤더 ${HEADERS.join(", ")}만 됩니다)`,
               );
           } else if (kw === "error") fail(i, `#error ${rest}`);
-          else if (kw !== "" && kw !== "pragma" && kw !== "line")
+          else if (kw === "line") {
+            // #line 줄 ["파일"]: 다음 줄의 번호가 줄이 된다
+            const m = /^\s*(\d+)\s*("(?:\\.|[^"\\])*")?\s*$/.exec(
+              expand(rest, i),
+            );
+            if (!m) fail(i, "#line 뒤에는 줄 번호를 씁니다");
+            else {
+              lineShift = Number(m[1]) - i - 2;
+              if (m[2]) fileName = m[2];
+            }
+          } else if (kw !== "" && kw !== "pragma")
             fail(i, `지원하지 않는 전처리 지시문 #${kw}`);
         }
       }
