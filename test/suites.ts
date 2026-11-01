@@ -54,18 +54,23 @@ function c17(file: string, src: string): string {
         "-Werror=incompatible-pointer-types",
         // K&R 함수 정의는 C23 에서 없어졌다. 우리도 받지 않는다
         "-Werror=deprecated-non-prototype",
-        // int main() 은 C17 에서도 맞다(C23 에선 (void) 와 같다)
-        "-Wno-strict-prototypes",
-        // int main() 은 C17 에서도 맞다(C23 에선 (void) 와 같다)
-        "-Wno-strict-prototypes",
         "-fsyntax-only",
         file,
       ],
       { stdio: "pipe" },
     );
   } catch (e) {
-    const msg = String((e as { stderr?: Buffer }).stderr ?? "");
-    why = /error: (.*)/.exec(msg)?.[1]?.slice(0, 60) ?? "clang 거부";
+    // 이 경고 묶음은 int main() 도 걸지만 그건 C17 에서 맞다(C23 에선 (void) 와 같다). K&R 정의만 거른다
+    const errors = [
+      ...String((e as { stderr?: Buffer }).stderr ?? "").matchAll(
+        /error: (.*)/g,
+      ),
+    ]
+      .map((m) => m[1])
+      .filter(
+        (m) => !m.startsWith("a function declaration without a prototype"),
+      );
+    why = errors[0]?.slice(0, 60) ?? "";
   }
   stdMemo[key] = why;
   return why;
