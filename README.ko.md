@@ -14,7 +14,7 @@ C17 코드를 브라우저에서 돌리면서 줄마다 스택과 힙을 기록�
 
 [English](./README.md) · 한국어
 
-[**써 보기**](https://cs.yeolyi.com/lab/c) · [설치](#설치) · [API](#api) · [표준 적합성](#표준-적합성)
+[**써 보기**](https://cs.yeolyi.com/lab/c) · [설치](#설치) · [API](#api) · [표준 적합성](#표준-적합성) · [명세](./SPEC.ko.md)
 
 <img src=".github/hero.gif" alt="연결 리스트를 한 줄씩 실행하며 스택·힙·출력이 바뀌는 모습" width="880">
 
@@ -163,6 +163,8 @@ pnpm test:suites   # 위 시험 모음(처음 돌릴 때 받는다. clang 필요
 - **표준 라이브러리는 일부.** `stdio`(`printf` 무리, 메모리 안 파일), `stdlib`, `string`, `ctype`, `math`, `time`. `scanf`는 없습니다.
 - **오류 메시지는 지금 한국어뿐입니다.**
 - 재귀 깊이는 JavaScript 스택이 정합니다(수천 단계).
+
+지원하는 것 전체와 메모리 배치, 검증 방법은 [명세](./SPEC.ko.md)에 있습니다.
 
 ## 라이선스
 

@@ -14,7 +14,7 @@ and stop at the exact line where memory goes wrong.
 
 English · [한국어](./README.ko.md)
 
-[**Live demo**](https://cs.yeolyi.com/lab/c) · [Install](#install) · [API](#api) · [Conformance](#conformance)
+[**Live demo**](https://cs.yeolyi.com/lab/c) · [Install](#install) · [API](#api) · [Conformance](#conformance) · [Spec](./SPEC.md)
 
 <img src=".github/hero.gif" alt="Stepping through a linked list: the highlighted line moves while the stack, heap and output update" width="880">
 
@@ -163,6 +163,8 @@ Recording is the slow part: crowser records the first `limit` steps with an inte
 - **Partial standard library.** `stdio` (`printf` family, in-memory files), `stdlib`, `string`, `ctype`, `math`, `time`. No `scanf`.
 - **Error messages are in Korean** for now.
 - Recursion depth is limited by the JavaScript stack (a few thousand frames).
+
+The full list of what is supported, the memory layout and how it is verified is in [SPEC.md](./SPEC.md).
 
 ## License
 
