@@ -1,11 +1,12 @@
 // 해석기 시험. node test/run.ts [--suite]
 // 1. examples/*.c 를 clang 으로 컴파일해 돌린 출력과 우리 출력을 대조한다(글에 넣는 예제는 여기 둔다).
 // 2. errors/*.c 는 진짜 C 라면 조용히 망가질 코드다. 첫 줄 주석 `// 오류 <줄>` 의 줄에서 멈춰야 한다.
-// 3. --suite: c-testsuite(github.com/c-testsuite/c-testsuite)의 single-exec 220개 통과율. 처음에 test/.cache 로 받는다.
+// 3. --suite [이름…]: 남이 만든 시험 모음의 통과율(suites.ts). 처음에 test/.cache 로 받는다.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { loadParser, run } from "../src/index.ts";
+import { runSuites } from "./suites.ts";
 
 const here = import.meta.dirname;
 const nm = (p: string) => path.join(here, "../node_modules", p);
@@ -50,55 +51,6 @@ for (const f of fs.readdirSync(path.join(here, "errors")).sort()) {
   }
 }
 
-if (process.argv.includes("--suite")) {
-  const repo = path.join(here, ".cache/c-testsuite");
-  if (!fs.existsSync(repo))
-    execFileSync("git", [
-      "clone",
-      "-q",
-      "--depth=1",
-      "https://github.com/c-testsuite/c-testsuite",
-      repo,
-    ]);
-  const dir = path.join(repo, "tests/single-exec");
-  const files = fs
-    .readdirSync(dir)
-    .filter((f) => f.endsWith(".c"))
-    .sort();
-  const reasons = new Map<string, string[]>();
-  let pass = 0;
-  for (const f of files) {
-    const src = fs.readFileSync(path.join(dir, f), "utf8");
-    const want = fs.readFileSync(path.join(dir, `${f}.expected`), "utf8");
-    let why: string;
-    try {
-      const r = run(parser, src, { limit: 0 });
-      why = r.error
-        ? r.error.msg
-        : r.exit !== 0
-          ? `exit ${r.exit}`
-          : r.out !== want
-            ? "출력 다름"
-            : "";
-    } catch (e) {
-      why = `JS 예외 ${(e as Error).message}`;
-    }
-    if (!why) pass++;
-    else {
-      const key = why
-        .replace(/0x[0-9a-f]+/g, "0x…")
-        .split(" ")
-        .slice(0, 3)
-        .join(" ");
-      reasons.set(key, [...(reasons.get(key) ?? []), f]);
-    }
-  }
-  console.log(
-    `\nc-testsuite ${pass}/${files.length} (${Math.round((pass / files.length) * 100)}%)`,
-  );
-  for (const [k, v] of [...reasons]
-    .sort((a, b) => b[1].length - a[1].length)
-    .slice(0, 25))
-    console.log(String(v.length).padStart(4), k, v.slice(0, 3).join(" "));
-}
+const at = process.argv.indexOf("--suite");
+if (at >= 0) runSuites(parser, process.argv.slice(at + 1));
 process.exit(failed ? 1 : 0);

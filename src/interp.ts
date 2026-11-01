@@ -223,7 +223,7 @@ class Exit {
 class Continue {}
 
 // 식의 결과: 값(rvalue) 또는 자리(lvalue, 주소). 배열·struct 자리는 쓸 때 바뀐다
-type Val = { t: CType; v: number; lv?: false; agg?: boolean };
+type Val = { t: CType; v: Num; lv?: false; agg?: boolean };
 type Place = { t: CType; addr: number; lv: true };
 type X = Val | Place;
 
@@ -238,6 +238,24 @@ type Func = {
 type Binding = { addr: number; type: CType };
 
 const hex = (v: number) => `0x${v.toString(16)}`;
+
+// 정수 값. 64비트 정수가 2^53 을 넘으면 JS 수로는 끝자리가 틀려 bigint 로 둔다. 그 안쪽이면 늘 number 라
+// (norm) 두 값의 표현이 다르면 값도 다르고, === 비교가 그대로 맞는다
+type Num = number | bigint;
+const SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+const norm = (b: bigint): Num => (b >= -SAFE && b <= SAFE ? Number(b) : b);
+const num = (v: Num) => (typeof v === "number" ? v : Number(v));
+const big = (v: Num) =>
+  typeof v === "bigint" ? v : BigInt(Number.isFinite(v) ? Math.trunc(v) : 0);
+// 16진 실수 0x1.8p3 = 1.5 × 2^3 (Number 는 읽지 못한다)
+const hexFloat = (text: string) => {
+  const m = /^(-?)0x([0-9a-f]*)(?:\.([0-9a-f]*))?p([-+]?\d+)$/i.exec(text);
+  if (!m) return Number.NaN;
+  const frac = m[3] ?? "";
+  const mant = Number.parseInt(`${m[2]}${frac}` || "0", 16) / 16 ** frac.length;
+  return (m[1] ? -1 : 1) * mant * 2 ** Number(m[4]);
+};
+const neg = (v: Num): Num => (typeof v === "number" ? -v : norm(-v));
 const ESC: Record<string, string> = {
   n: "\n",
   t: "\t",
@@ -294,7 +312,10 @@ export function syntaxError(parser: Parser, src: string): CError | null {
 export function run(
   parser: Parser,
   src: string,
-  { limit = 3000 }: { limit?: number } = {},
+  {
+    limit = 3000,
+    ops: opsLimit = OPS_LIMIT,
+  }: { limit?: number; ops?: number } = {},
 ): CResult {
   const pre = preprocess(src);
   const parsed = pre.error ? null : parser.parse(pre.code);
@@ -365,7 +386,7 @@ export function run(
         );
     }
   };
-  const load = (n: Node | null, addr: number, t: CType): number => {
+  const load = (n: Node | null, addr: number, t: CType): Num => {
     check(n, addr, t.size);
     if (t.k === "ptr") return Number(mem.getBigUint64(addr, true));
     if (t.k === "float")
@@ -381,28 +402,29 @@ export function run(
       case 4:
         return t.signed ? mem.getInt32(addr, true) : mem.getUint32(addr, true);
       default:
-        return Number(
+        return norm(
           t.signed ? mem.getBigInt64(addr, true) : mem.getBigUint64(addr, true),
         );
     }
   };
-  const store = (n: Node | null, addr: number, t: CType, v: number) => {
+  const store = (n: Node | null, addr: number, t: CType, v: Num) => {
     check(n, addr, t.size);
-    if (t.k === "ptr") return mem.setBigUint64(addr, BigInt(v), true);
+    if (t.k === "ptr") return mem.setBigUint64(addr, BigInt(num(v)), true);
     if (t.k === "float")
       return t.size === 4
-        ? mem.setFloat32(addr, v, true)
-        : mem.setFloat64(addr, v, true);
+        ? mem.setFloat32(addr, num(v), true)
+        : mem.setFloat64(addr, num(v), true);
     if (t.k !== "int") return fail(n, `${typeName(t)} 에는 쓸 수 없습니다`);
+    if (t.size === 8)
+      return mem.setBigUint64(addr, BigInt.asUintN(64, big(v)), true);
+    const x = typeof v === "bigint" ? Number(BigInt.asUintN(32, v)) : v;
     switch (t.size) {
       case 1:
-        return mem.setUint8(addr, v & 0xff);
+        return mem.setUint8(addr, x & 0xff);
       case 2:
-        return mem.setUint16(addr, v & 0xffff, true);
-      case 4:
-        return mem.setUint32(addr, v >>> 0, true);
+        return mem.setUint16(addr, x & 0xffff, true);
       default:
-        return mem.setBigInt64(addr, BigInt(Math.trunc(v)), true);
+        return mem.setUint32(addr, x >>> 0, true);
     }
   };
   const copy = (n: Node | null, to: number, from: number, size: number) => {
@@ -411,17 +433,30 @@ export function run(
     for (let i = 0; i < size; i++) mem.setUint8(to + i, mem.getUint8(from + i));
   };
   // C 정수 규칙: 타입 크기로 자른다
-  const wrap = (t: CType, v: number) => {
-    if (t.k === "float") return t.size === 4 ? Math.fround(v) : v;
-    if (t.k !== "int") return v;
+  function wrap(t: CType, v: Num): Num {
+    if (t.k === "float") return t.size === 4 ? Math.fround(num(v)) : num(v);
+    if (t.k !== "int") return num(v);
     if (t === T.bool) return v ? 1 : 0;
+    if (t.size === 8) {
+      if (typeof v === "number") {
+        const x = Math.trunc(v);
+        if (Number.isSafeInteger(x) && (t.signed || x >= 0)) return x;
+      }
+      return norm(
+        t.signed ? BigInt.asIntN(64, big(v)) : BigInt.asUintN(64, big(v)),
+      );
+    }
     const bits = t.size * 8;
-    if (bits >= 53) return Math.trunc(v);
+    if (typeof v === "bigint")
+      return Number(
+        t.signed ? BigInt.asIntN(bits, v) : BigInt.asUintN(bits, v),
+      );
     const m = 2 ** bits;
     let r = ((Math.trunc(v) % m) + m) % m;
+    if (Number.isNaN(r)) r = 0;
     if (t.signed && r >= m / 2) r -= m;
     return r;
-  };
+  }
 
   // --- 타입 읽기 ---
   const typeOf = (node: Node): CType => {
@@ -575,9 +610,7 @@ export function run(
   const rewrapArray = (t: CType, n: number): CType =>
     t.k === "array" ? arr(rewrapArray(t.of, n), t.n) : arr(t, n);
 
-  const constEval = (n: Node): number => {
-    return rvalue(n, evalExpr(n)).v;
-  };
+  const constEval = (n: Node): number => num(rvalue(n, evalExpr(n)).v);
 
   // --- 변수 ---
   const frame = () => frames[frames.length - 1];
@@ -620,7 +653,7 @@ export function run(
   const readStr = (n: Node, a: number) => {
     let s = "";
     for (let i = 0; i < 100000; i++) {
-      const c = load(n, a + i, T.uchar);
+      const c = num(load(n, a + i, T.uchar));
       if (c === 0) return s;
       s += String.fromCharCode(c);
     }
@@ -641,16 +674,23 @@ export function run(
     if (a.t.k === "ptr" && b.t.k === "int" && (op === "+" || op === "-"))
       return {
         t: a.t,
-        v: a.v + (op === "+" ? 1 : -1) * b.v * Math.max(a.t.to.size, 1),
+        v:
+          num(a.v) +
+          (op === "+" ? 1 : -1) * num(b.v) * Math.max(a.t.to.size, 1),
       };
     if (a.t.k === "int" && b.t.k === "ptr" && op === "+")
-      return { t: b.t, v: b.v + a.v * Math.max(b.t.to.size, 1) };
+      return { t: b.t, v: num(b.v) + num(a.v) * Math.max(b.t.to.size, 1) };
     if (a.t.k === "ptr" && b.t.k === "ptr" && op === "-")
-      return { t: T.long, v: (a.v - b.v) / Math.max(a.t.to.size, 1) };
+      return {
+        t: T.long,
+        v: Math.trunc((num(a.v) - num(b.v)) / Math.max(a.t.to.size, 1)),
+      };
     if (a.t.k === "float" || b.t.k === "float") return floatArith(n, op, a, b);
-    const t = promote(a.t, b.t);
+    // 시프트의 타입은 왼쪽 값만 보고 정한다(오른쪽은 몇 칸인지일 뿐)
+    const shift = op === "<<" || op === ">>";
+    const t = shift ? promote(a.t, a.t) : promote(a.t, b.t);
     const x = a.t.k === "int" ? wrap(t, a.v) : a.v;
-    const y = b.t.k === "int" ? wrap(t, b.v) : b.v;
+    const y = shift ? num(b.v) : b.t.k === "int" ? wrap(t, b.v) : b.v;
     const cmp: Record<string, boolean> = {
       "<": x < y,
       ">": x > y,
@@ -661,6 +701,11 @@ export function run(
     };
     if (op in cmp) return { t: T.int, v: cmp[op] ? 1 : 0 };
     if ((op === "/" || op === "%") && y === 0) fail(n, "0으로 나눴습니다");
+    if (t.size === 8) return { t, v: arith64(n, op, t, x, y) };
+    return { t, v: wrap(t, arith32(n, op, t, num(x), num(y))) };
+  };
+  // 4바이트 이하 정수(int 로 승격된 값)
+  const arith32 = (n: Node, op: string, t: IntType, x: number, y: number) => {
     let v: number;
     switch (op) {
       case "+":
@@ -670,7 +715,7 @@ export function run(
         v = x - y;
         break;
       case "*":
-        v = t.size === 4 ? Math.imul(x, y) : x * y;
+        v = Math.imul(x, y);
         break;
       case "/":
         v = Math.trunc(x / y);
@@ -679,36 +724,87 @@ export function run(
         v = x % y;
         break;
       case "&":
-        v = t.size === 8 ? Number(BigInt(x) & BigInt(y)) : x & y;
+        v = x & y;
         break;
       case "|":
-        v = t.size === 8 ? Number(BigInt(x) | BigInt(y)) : x | y;
+        v = x | y;
         break;
       case "^":
-        v = t.size === 8 ? Number(BigInt(x) ^ BigInt(y)) : x ^ y;
+        v = x ^ y;
         break;
       case "<<":
-        v = t.size === 8 ? Number(BigInt(x) << BigInt(y)) : x * 2 ** y;
+        v = x * 2 ** (y & 31);
         break;
       case ">>":
-        v =
-          t.size === 8
-            ? Number(BigInt(x) >> BigInt(y))
-            : t.signed
-              ? x >> y
-              : x >>> y;
+        v = t.signed ? x >> y : x >>> y;
         break;
       default:
         return fail(n, `지원하지 않는 연산자 ${op}`);
     }
-    return { t, v: wrap(t, v) };
+    return v;
+  };
+  // 8바이트 정수. 결과가 2^53 안쪽이면 수로 빨리, 아니면 bigint 로 정확히
+  const arith64 = (n: Node, op: string, t: IntType, x: Num, y: Num): Num => {
+    if (typeof x === "number" && typeof y === "number") {
+      const r =
+        op === "+"
+          ? x + y
+          : op === "-"
+            ? x - y
+            : op === "*"
+              ? x * y
+              : op === "%"
+                ? x % y
+                : op === "/" && Math.abs(x) <= 0xffffffff
+                  ? Math.trunc(x / y)
+                  : Number.NaN;
+      if (Number.isSafeInteger(r) && (t.signed || r >= 0)) return r;
+    }
+    const X = big(x);
+    const Y = big(y);
+    let v: bigint;
+    switch (op) {
+      case "+":
+        v = X + Y;
+        break;
+      case "-":
+        v = X - Y;
+        break;
+      case "*":
+        v = X * Y;
+        break;
+      case "/":
+        v = X / Y;
+        break;
+      case "%":
+        v = X % Y;
+        break;
+      case "&":
+        v = X & Y;
+        break;
+      case "|":
+        v = X | Y;
+        break;
+      case "^":
+        v = X ^ Y;
+        break;
+      case "<<":
+        v = X << (Y & 63n);
+        break;
+      case ">>":
+        v = X >> (Y & 63n);
+        break;
+      default:
+        return fail(n, `지원하지 않는 연산자 ${op}`);
+    }
+    return wrap(t, v);
   };
 
   // 실수가 끼면 실수로: 하나라도 double 이면 double, 아니면 float
   const floatArith = (n: Node, op: string, a: Val, b: Val): Val => {
     const t = a.t === T.double || b.t === T.double ? T.double : T.float;
-    const x = a.v;
-    const y = b.v;
+    const x = num(a.v);
+    const y = num(b.v);
     const cmp: Record<string, boolean> = {
       "<": x < y,
       ">": x > y,
@@ -733,11 +829,16 @@ export function run(
   const assign = (n: Node, place: X, val: Val) => {
     if (!place.lv) return fail(n, "대입할 수 없는 자리입니다");
     // malloc 이 준 블록은 타입이 없다. 처음 담긴 포인터의 타입으로 블록을 읽어 보인다
-    if (place.t.k === "ptr" && place.t.to.k !== "void" && val.v >= HEAP_BASE) {
+    if (
+      place.t.k === "ptr" &&
+      place.t.to.k !== "void" &&
+      num(val.v) >= HEAP_BASE
+    ) {
       const b = heap.find((h) => h.addr === val.v);
       if (b && !b.ctype) b.ctype = place.t.to;
     }
-    if (place.t.k === "struct") return copy(n, place.addr, val.v, place.t.size);
+    if (place.t.k === "struct")
+      return copy(n, place.addr, num(val.v), place.t.size);
     if (place.t.k === "array")
       return fail(n, "배열에는 통째로 대입할 수 없습니다");
     if (place.t.k === "ptr" && val.t.k === "int" && val.v !== 0)
@@ -802,7 +903,7 @@ export function run(
   };
 
   const tick = (n: Node) => {
-    if (++ops > OPS_LIMIT)
+    if (++ops > opsLimit)
       fail(n, "너무 오래 걸려 멈췄습니다. 끝나지 않는 반복이 있는지 봅시다");
   };
 
@@ -810,16 +911,36 @@ export function run(
     tick(n);
     switch (n.type) {
       case "number_literal": {
-        if (/[.eEpP]/.test(n.text) && !/^0x[0-9a-f]+[ul]*$/i.test(n.text)) {
+        const hexNum = /^-?0x/i.test(n.text);
+        if (hexNum ? /[.pP]/.test(n.text) : /[.eE]/.test(n.text)) {
           const f = /[fF]$/.test(n.text);
-          const v = Number(n.text.replace(/[fFlL]$/, ""));
+          const body = n.text.replace(/[fFlL]$/, "");
+          const v = hexNum ? hexFloat(body) : Number(body);
           return { t: f ? T.float : T.double, v: f ? Math.fround(v) : v };
         }
-        const text = n.text.replace(/[uUlL]+$/, "");
-        // 0 으로 시작하면 8진수(017 은 15). Number 가 0x·0o·0b 를 읽는다
-        const v = Number(text.replace(/^0(?=[0-7])/, "0o"));
-        const big = /[lL]/.test(n.text) || Math.abs(v) > 0x7fffffff;
-        return { t: big ? T.long : T.int, v };
+        const suffix = /[uUlL]*$/.exec(n.text)?.[0].toLowerCase() ?? "";
+        // tree-sitter 가 앞의 - 까지 수에 붙여 읽을 때가 있다. 수와 단항 - 로 나눠 계산한다
+        const minus = n.text.startsWith("-");
+        const text = n.text.slice(minus ? 1 : 0, n.text.length - suffix.length);
+        // 0 으로 시작하면 8진수(017 은 15). BigInt 가 0x·0o·0b 를 읽는다
+        const v = BigInt(text.replace(/^0(?=[0-7])/, "0o"));
+        // 값이 들어가는 첫 타입(C17 6.4.4.1). 10진수는 부호 있는 타입만, 16·8진수는 부호 없는 것도 거친다
+        const decimal = !/^0./.test(text);
+        const types = suffix.includes("u")
+          ? suffix.includes("l")
+            ? [T.ulong]
+            : [T.uint, T.ulong]
+          : suffix.includes("l")
+            ? decimal
+              ? [T.long]
+              : [T.long, T.ulong]
+            : decimal
+              ? [T.int, T.long]
+              : [T.int, T.uint, T.long, T.ulong];
+        const fits = (t: IntType) =>
+          v < 2n ** BigInt(t.size * 8 - (t.signed ? 1 : 0));
+        const t = types.find(fits) ?? T.ulong;
+        return { t, v: minus ? wrap(t, -v) : norm(v) };
       }
       case "char_literal":
         return { t: T.int, v: unquote(n.text.slice(1, -1)).charCodeAt(0) };
@@ -881,11 +1002,11 @@ export function run(
         const op = field(n, "operator").text;
         const a = rvalue(n, evalExpr(field(n, "argument")));
         const t = a.t.k === "int" && a.t.size < 4 ? T.int : a.t;
-        if (op === "-") return { t, v: wrap(t, -a.v) };
+        if (op === "-") return { t, v: wrap(t, neg(a.v)) };
         if (op === "+") return { t, v: a.v };
         if (op === "!") return { t: T.int, v: a.v ? 0 : 1 };
         if (op === "~")
-          return { t, v: wrap(t, t.size === 8 ? Number(~BigInt(a.v)) : ~a.v) };
+          return { t, v: wrap(t, t.size === 8 ? ~big(a.v) : ~num(a.v)) };
         return fail(n, `지원하지 않는 연산자 ${op}`);
       }
       case "pointer_expression": {
@@ -893,14 +1014,15 @@ export function run(
         const argNode = field(n, "argument");
         if (op === "&") {
           const x = evalExpr(argNode);
-          if (x.t.k === "func") return { t: ptr(x.t), v: x.lv ? x.addr : x.v };
+          if (x.t.k === "func")
+            return { t: ptr(x.t), v: x.lv ? x.addr : num(x.v) };
           if (!x.lv) return fail(n, "주소를 얻을 수 없는 식입니다");
           return { t: ptr(x.t), v: x.addr };
         }
         const p = rvalue(n, evalExpr(argNode));
         if (p.t.k !== "ptr") return fail(n, "포인터가 아닌 것을 따라갔습니다");
         if (p.v === 0) fail(n, "NULL 포인터를 따라갔습니다");
-        return { t: p.t.to, addr: p.v, lv: true };
+        return { t: p.t.to, addr: num(p.v), lv: true };
       }
       case "update_expression": {
         const op = field(n, "operator").text;
@@ -922,12 +1044,12 @@ export function run(
           if (p.t.k !== "ptr" || p.t.to.k !== "struct")
             return fail(n, "-> 앞은 struct 포인터여야 합니다");
           st = p.t.to;
-          addr = p.v;
+          addr = num(p.v);
           if (addr === 0) fail(n, "NULL 포인터를 따라갔습니다");
         } else {
           if (b.t.k !== "struct") return fail(n, ". 앞은 struct 여야 합니다");
           st = b.t;
-          addr = b.lv ? b.addr : b.v;
+          addr = b.lv ? b.addr : num(b.v);
         }
         const f = st.fields?.find((x) => x.name === fname);
         if (!f) return fail(n, `${typeName(st)}에 ${fname} 필드가 없습니다`);
@@ -940,12 +1062,13 @@ export function run(
         const i = rvalue(n, evalExpr(field(n, "index")));
         if (a.t.k !== "ptr")
           return fail(n, "[] 앞은 배열이나 포인터여야 합니다");
-        if (base0.lv && base0.t.k === "array" && (i.v < 0 || i.v >= base0.t.n))
+        const iv = num(i.v);
+        if (base0.lv && base0.t.k === "array" && (iv < 0 || iv >= base0.t.n))
           fail(
             n,
-            `배열 ${arrayNode.text}[${base0.t.n}]의 범위 밖 인덱스 ${i.v}입니다`,
+            `배열 ${arrayNode.text}[${base0.t.n}]의 범위 밖 인덱스 ${iv}입니다`,
           );
-        return { t: a.t.to, addr: a.v + i.v * a.t.to.size, lv: true };
+        return { t: a.t.to, addr: num(a.v) + iv * a.t.to.size, lv: true };
       }
       case "sizeof_expression": {
         const tn = n.childForFieldName("type");
@@ -1012,6 +1135,7 @@ export function run(
       .map((a) => rvalue(n, evalExpr(a)));
     const arg = (i: number) =>
       args[i] ?? fail(n, `${name}에 인자가 모자랍니다`);
+    const argN = (i: number) => num(arg(i).v);
     // 이름으로 부르면 표준 함수일 수 있다. 같은 이름의 변수나 직접 만든 함수가 있으면 그쪽
     const builtin =
       fnNode.type === "identifier" && !lookupMaybe(name) && !funcs.has(name);
@@ -1019,7 +1143,7 @@ export function run(
       const fv = rvalue(n, evalExpr(fnNode));
       const isFn =
         fv.t.k === "func" || (fv.t.k === "ptr" && fv.t.to.k === "func");
-      const f = isFn ? byAddr.get(fv.v) : undefined;
+      const f = isFn ? byAddr.get(num(fv.v)) : undefined;
       if (!f)
         return fail(
           n,
@@ -1034,15 +1158,15 @@ export function run(
     switch (name) {
       case "malloc":
       case "calloc": {
-        const size = name === "calloc" ? arg(0).v * arg(1).v : arg(0).v;
+        const size = name === "calloc" ? argN(0) * argN(1) : argN(0);
         const addr = heapAlloc(size, n);
         for (let i = 0; i < size; i++)
           mem.setUint8(addr + i, name === "calloc" ? 0 : 0xcd);
         return { t: ptr(T.void), v: addr };
       }
       case "realloc": {
-        const old = arg(0).v;
-        const size = arg(1).v;
+        const old = argN(0);
+        const size = argN(1);
         const r = heapAlloc(size, n);
         if (old) {
           const b = heap.find((h) => h.addr === old && !h.freed);
@@ -1055,7 +1179,7 @@ export function run(
         return { t: ptr(T.void), v: r };
       }
       case "free": {
-        const a = arg(0).v;
+        const a = argN(0);
         if (a === 0) return { t: T.void, v: 0 };
         const b = heap.find((h) => h.addr === a);
         if (!b) fail(n, "malloc 으로 받지 않은 주소를 free 했습니다");
@@ -1064,40 +1188,42 @@ export function run(
         return { t: T.void, v: 0 };
       }
       case "printf": {
-        const s = format(n, readStr(n, arg(0).v), args.slice(1));
+        const s = format(n, readStr(n, argN(0)), args.slice(1));
         out += s;
         return { t: T.int, v: s.length };
       }
       case "putchar":
-        out += String.fromCharCode(arg(0).v & 0xff);
-        return { t: T.int, v: arg(0).v };
+        out += String.fromCharCode(argN(0) & 0xff);
+        return { t: T.int, v: argN(0) };
       case "puts":
-        out += `${readStr(n, arg(0).v)}\n`;
+        out += `${readStr(n, argN(0))}\n`;
         return { t: T.int, v: 0 };
       case "strlen":
-        return { t: T.ulong, v: readStr(n, arg(0).v).length };
+        return { t: T.ulong, v: readStr(n, argN(0)).length };
       case "strcmp": {
-        const a = readStr(n, arg(0).v);
-        const b = readStr(n, arg(1).v);
+        const a = readStr(n, argN(0));
+        const b = readStr(n, argN(1));
         return { t: T.int, v: a < b ? -1 : a > b ? 1 : 0 };
       }
       case "strcpy": {
-        const s = readStr(n, arg(1).v);
+        const s = readStr(n, argN(1));
         for (let i = 0; i <= s.length; i++)
-          store(n, arg(0).v + i, T.char, i < s.length ? s.charCodeAt(i) : 0);
+          store(n, argN(0) + i, T.char, i < s.length ? s.charCodeAt(i) : 0);
         return arg(0);
       }
       case "memset":
-        for (let i = 0; i < arg(2).v; i++)
-          store(n, arg(0).v + i, T.uchar, arg(1).v);
+        for (let i = 0; i < argN(2); i++)
+          store(n, argN(0) + i, T.uchar, argN(1));
         return arg(0);
       case "memcpy":
-        copy(n, arg(0).v, arg(1).v, arg(2).v);
+        copy(n, argN(0), argN(1), argN(2));
         return arg(0);
       case "abs":
-        return { t: T.int, v: Math.abs(arg(0).v) };
-      case "labs":
-        return { t: T.long, v: Math.abs(arg(0).v) };
+        return { t: T.int, v: Math.abs(argN(0)) };
+      case "labs": {
+        const v = arg(0).v;
+        return { t: T.long, v: v < 0 ? neg(v) : v };
+      }
       case "sqrt":
       case "fabs":
       case "floor":
@@ -1118,17 +1244,17 @@ export function run(
           exp: Math.exp,
           log: Math.log,
         }[name];
-        return { t: T.double, v: f(arg(0).v) };
+        return { t: T.double, v: f(argN(0)) };
       }
       case "pow":
-        return { t: T.double, v: arg(0).v ** arg(1).v };
+        return { t: T.double, v: argN(0) ** argN(1) };
       case "isdigit":
       case "isalpha":
       case "isalnum":
       case "isspace":
       case "isupper":
       case "islower": {
-        const ch = String.fromCharCode(arg(0).v);
+        const ch = String.fromCharCode(argN(0));
         const re = {
           isdigit: /\d/,
           isalpha: /[A-Za-z]/,
@@ -1141,7 +1267,7 @@ export function run(
       }
       case "toupper":
       case "tolower": {
-        const ch = String.fromCharCode(arg(0).v);
+        const ch = String.fromCharCode(argN(0));
         return {
           t: T.int,
           v: (name === "toupper"
@@ -1151,41 +1277,42 @@ export function run(
         };
       }
       case "strcat": {
-        const d = arg(0).v;
+        const d = argN(0);
         const at = d + readStr(n, d).length;
-        const src = readStr(n, arg(1).v);
+        const src = readStr(n, argN(1));
         for (let i = 0; i <= src.length; i++)
           store(n, at + i, T.char, i < src.length ? src.charCodeAt(i) : 0);
         return arg(0);
       }
       case "strncmp": {
-        const a = readStr(n, arg(0).v).slice(0, arg(2).v);
-        const b = readStr(n, arg(1).v).slice(0, arg(2).v);
+        const a = readStr(n, argN(0)).slice(0, argN(2));
+        const b = readStr(n, argN(1)).slice(0, argN(2));
         return { t: T.int, v: a < b ? -1 : a > b ? 1 : 0 };
       }
       case "memcmp": {
-        for (let i = 0; i < arg(2).v; i++) {
+        for (let i = 0; i < argN(2); i++) {
           const d =
-            load(n, arg(0).v + i, T.uchar) - load(n, arg(1).v + i, T.uchar);
+            num(load(n, argN(0) + i, T.uchar)) -
+            num(load(n, argN(1) + i, T.uchar));
           if (d) return { t: T.int, v: d };
         }
         return { t: T.int, v: 0 };
       }
       case "assert":
-        if (!arg(0).v)
+        if (!argN(0))
           fail(n, `assert 가 실패했습니다: ${field(n, "arguments").text}`);
         return { t: T.void, v: 0 };
       case "abort":
         return fail(n, "abort 로 멈췄습니다");
       case "rand":
-        // 같은 결과가 나오게 고정된 씨앗의 선형 합동 생성기
-        seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
-        return { t: T.int, v: (seed >>> 16) & 0x7fff };
+        // 같은 결과가 나오게 고정된 씨앗의 선형 합동 생성기. 0 ~ RAND_MAX(2^31-1)
+        seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
+        return { t: T.int, v: seed };
       case "srand":
-        seed = arg(0).v >>> 0;
+        seed = argN(0) >>> 0;
         return { t: T.void, v: 0 };
       case "exit":
-        throw new Exit(arg(0).v);
+        throw new Exit(argN(0));
     }
     return fail(n, `선언하지 않은 함수 ${name}`);
   }
@@ -1203,7 +1330,7 @@ export function run(
     let i = 0;
     const next = () => args[i++] ?? fail(n, "printf 에 넘긴 값이 모자랍니다");
     return fmt.replace(
-      /%([-0 +#]*)(\*|\d*)(?:\.(\*|\d*))?(hh|h|ll|l|z|L)?([diouxXcspfFeEgG%])/g,
+      /%([-0 +#]*)(\*|\d*)(?:\.(\*|\d*))?(hh|h|ll|l|z|j|t|L)?([diouxXcspfFeEgG%])/g,
       (
         _,
         flags: string,
@@ -1213,24 +1340,34 @@ export function run(
         c: string,
       ) => {
         if (c === "%") return "%";
-        const w = width === "*" ? next().v : Number.parseInt(width || "0", 10);
-        const p =
+        let w =
+          width === "*" ? num(next().v) : Number.parseInt(width || "0", 10);
+        // 폭을 음수로 넘기면 왼쪽 맞춤
+        if (w < 0) {
+          flags += "-";
+          w = -w;
+        }
+        let p =
           prec === undefined
             ? null
             : prec === "*"
-              ? next().v
+              ? num(next().v)
               : Number.parseInt(prec || "0", 10);
+        if (p !== null && p < 0) p = null;
         const a = next();
-        const wide = len === "l" || len === "ll" || len === "z";
+        // 길이 수식어가 정하는 정수의 비트 수
+        const bits =
+          len === "hh" ? 8 : len === "h" ? 16 : len && len !== "L" ? 64 : 32;
         let s: string;
         let numeric = true;
         switch (c) {
           case "d":
-          case "i":
-            s = String(Math.abs(a.v));
+          case "i": {
+            const v = BigInt.asIntN(bits, big(a.v));
+            s = p === 0 && v === 0n ? "" : (v < 0n ? -v : v).toString();
             if (p !== null) s = s.padStart(p, "0");
             s =
-              (a.v < 0
+              (v < 0n
                 ? "-"
                 : flags.includes("+")
                   ? "+"
@@ -1238,36 +1375,39 @@ export function run(
                     ? " "
                     : "") + s;
             break;
+          }
           case "u":
           case "o":
           case "x":
           case "X": {
-            const u =
-              a.v < 0
-                ? BigInt.asUintN(wide ? 64 : 32, BigInt(a.v))
-                : BigInt(a.v);
-            s = u.toString(c === "u" ? 10 : c === "o" ? 8 : 16);
+            const u = BigInt.asUintN(bits, big(a.v));
+            s =
+              p === 0 && u === 0n
+                ? ""
+                : u.toString(c === "u" ? 10 : c === "o" ? 8 : 16);
             if (c === "X") s = s.toUpperCase();
             if (p !== null) s = s.padStart(p, "0");
-            if (flags.includes("#") && u !== 0n && c !== "u")
-              s = (c === "o" ? "0" : c === "x" ? "0x" : "0X") + s;
+            if (flags.includes("#") && c === "o" && !s.startsWith("0"))
+              s = `0${s}`;
+            if (flags.includes("#") && u !== 0n && c !== "u" && c !== "o")
+              s = (c === "x" ? "0x" : "0X") + s;
             break;
           }
           case "c":
-            s = String.fromCharCode(a.v & 0xff);
+            s = String.fromCharCode(num(a.v) & 0xff);
             numeric = false;
             break;
           case "s":
-            s = readStr(n, a.v);
+            s = readStr(n, num(a.v));
             if (p !== null) s = s.slice(0, p);
             numeric = false;
             break;
           case "p":
-            s = hex(a.v);
+            s = hex(num(a.v));
             numeric = false;
             break;
           default:
-            s = formatFloat(a.v, c, p ?? 6, flags);
+            s = formatFloat(num(a.v), c, p ?? 6, flags);
         }
         if (flags.includes("-")) return s.padEnd(w);
         // 정수는 정밀도를 주면 0 채우기를 하지 않는다(실수는 한다)
@@ -1311,7 +1451,7 @@ export function run(
     if (!ret) return { t: f.ret, v: 0 };
     if (f.ret.k !== "struct") return { t: f.ret, v: wrap(f.ret, ret.v) };
     // struct 를 돌려주면 부른 쪽 스택에 자리를 잡아 옮긴다. 피호출자의 자리와 겹칠 수 있어 한 번 바이트로 꺼내 둔다
-    const bytes = read(ret.v, f.ret.size);
+    const bytes = read(num(ret.v), f.ret.size);
     const tmp = alloca(at, f.ret);
     bytes.forEach((x, i) => {
       mem.setUint8(tmp + i, x);
@@ -1345,11 +1485,12 @@ export function run(
         const v = Number(mem.getBigUint64(addr, true));
         return v === 0 ? "NULL" : hex(v);
       }
-      if (t.k === "float") return formatFloat(load(null, addr, t), "g", 6, "");
+      if (t.k === "float")
+        return formatFloat(num(load(null, addr, t)), "g", 6, "");
       if (t.k !== "int") return "?";
       const v = load(null, addr, t);
       if (t === T.char && v >= 32 && v < 127)
-        return `${v} '${String.fromCharCode(v)}'`;
+        return `${v} '${String.fromCharCode(num(v))}'`;
       return String(v);
     } catch {
       return "?";
@@ -1672,7 +1813,9 @@ export function run(
       { t: T.int, v: 1 },
       { t: ptr(ptr(T.char)), v: argv },
     ];
-    exit = invoke(main, mainArgs.slice(0, main.params.length), tree.rootNode).v;
+    exit = num(
+      invoke(main, mainArgs.slice(0, main.params.length), tree.rootNode).v,
+    );
   } catch (e) {
     if (e instanceof Fail) error = { line: e.line, msg: e.message };
     else if (e instanceof Exit) exit = e.code;
