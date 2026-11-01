@@ -180,6 +180,23 @@ function formatFloat(v: number, c: string, p: number, flags: string): string {
 }
 
 // 표준 함수가 돌려주는 값의 타입(나머지는 int). sizeof(malloc(1)) 처럼 부르지 않고 타입만 볼 때 쓴다
+// 표준 함수도 함수 포인터로 넘길 수 있게(qsort 에 strcmp 를) 0xc00 부터 가짜 주소를 하나씩 준다
+const LIBRARY = Object.fromEntries(
+  (
+    "abort abs aligned_alloc atof atoi atol atoll bsearch calloc clock exit fflush fma fprintf fputc fputs free " +
+    "getchar isalnum isalpha iscntrl isdigit isfinite isgraph isinf islower isnan isprint ispunct isspace isupper " +
+    "isxdigit labs llabs malloc memcmp memcpy memmove memset printf putc putchar puts qsort rand realloc signbit " +
+    "snprintf sprintf srand strcat strchr strcmp strcpy strlen strncat strncmp strncpy strrchr strstr strtod strtol " +
+    "strtoll strtoul strtoull time tolower toupper sqrt fabs floor ceil round trunc sin cos tan asin acos atan sinh " +
+    "cosh tanh exp exp2 log log10 log2 cbrt pow fmod atan2 hypot fmin fmax fdim ldexp copysign"
+  )
+    .split(" ")
+    .map((name, i) => [0xc00 + i * 4, name]),
+) as Record<number, string>;
+const LIBRARY_ADDR = new Map(
+  Object.entries(LIBRARY).map(([a, name]) => [name, Number(a)]),
+);
+
 const BUILTIN_RET: Record<string, CType> = {
   malloc: ptr(T.void),
   calloc: ptr(T.void),
@@ -212,7 +229,7 @@ const BUILTIN_RET: Record<string, CType> = {
   atof: T.double,
   strtod: T.double,
   ...Object.fromEntries(
-    `sqrt fabs floor ceil round trunc sin cos tan asin acos atan sinh cosh tanh exp exp2 log log10 log2 cbrt pow fmod atan2 hypot fmin fmax fdim copysign fma`
+    `sqrt fabs floor ceil round trunc sin cos tan asin acos atan sinh cosh tanh exp exp2 log log10 log2 cbrt pow fmod atan2 hypot fmin fmax fdim copysign fma ldexp`
       .split(" ")
       .map((f) => [f, T.double]),
   ),
@@ -220,6 +237,7 @@ const BUILTIN_RET: Record<string, CType> = {
   exit: T.void,
   abort: T.void,
 };
+const libType = (name: string) => func(BUILTIN_RET[name] ?? T.int);
 
 // ---------- 결과 ----------
 export type CVar = {
@@ -360,16 +378,47 @@ const utf8 = new TextEncoder();
 const bytesOf = (s: string) => String.fromCharCode(...utf8.encode(s));
 export const text = (bytes: string) =>
   new TextDecoder().decode(Uint8Array.from(bytes, (c) => c.charCodeAt(0)));
+const UCN = /^[uU]/;
 const unquote = (s: string) =>
-  s.replace(/\\(x[0-9a-fA-F]+|[0-7]{1,3}|.)|[\u0080-￿]+/g, (m, c?: string) =>
-    c === undefined
-      ? bytesOf(m)
-      : c[0] === "x"
-        ? String.fromCharCode(Number.parseInt(c.slice(1), 16) & 0xff)
-        : /^[0-7]/.test(c)
-          ? String.fromCharCode(Number.parseInt(c, 8) & 0xff)
-          : (ESC[c] ?? c),
+  s.replace(
+    /\\(x[0-9a-fA-F]+|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0-7]{1,3}|.)|[\u0080-￿]+/g,
+    (m, c?: string) =>
+      c === undefined
+        ? bytesOf(m)
+        : UCN.test(c)
+          ? bytesOf(String.fromCodePoint(Number.parseInt(c.slice(1), 16)))
+          : c[0] === "x"
+            ? String.fromCharCode(Number.parseInt(c.slice(1), 16) & 0xff)
+            : /^[0-7]/.test(c)
+              ? String.fromCharCode(Number.parseInt(c, 8) & 0xff)
+              : (ESC[c] ?? c),
   );
+// 넓은 문자(L·u·U 접두사)의 글자 값들. \x 를 1바이트로 자르지 않고, u 는 UTF-16 으로 쪼갠다
+const wideUnits = (s: string, utf16: boolean) => {
+  const out: number[] = [];
+  for (const m of s.matchAll(
+    /\\(x[0-9a-fA-F]+|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0-7]{1,3}|.)|[^\\]/gsu,
+  )) {
+    const c = m[1];
+    const v =
+      c === undefined
+        ? (m[0].codePointAt(0) ?? 0)
+        : c[0] === "x" || UCN.test(c)
+          ? Number.parseInt(c.slice(1), 16)
+          : /^[0-7]/.test(c)
+            ? Number.parseInt(c, 8)
+            : (ESC[c] ?? c).charCodeAt(0);
+    if (utf16 && v > 0xffff)
+      out.push(
+        0xd800 + ((v - 0x10000) >> 10),
+        0xdc00 + ((v - 0x10000) & 0x3ff),
+      );
+    else out.push(v);
+  }
+  return out;
+};
+// 문자열·문자 상수의 접두사(L"…", u'…')에 따른 글자 하나의 타입
+const PREFIX_TYPE: Record<string, CType> = { L: T.int, u: T.ushort, U: T.uint };
 
 type Tree = {
   type: string;
@@ -833,15 +882,53 @@ export function run(
     return { t: x.t, v: load(n, x.addr, x.t) };
   };
 
-  const literal = (n: Node) =>
-    n.type === "string_literal"
-      ? unquote(n.text.slice(1, -1))
-      : n.namedChildren.map((c) => unquote(c.text.slice(1, -1))).join("");
+  // 문자열 상수의 글자 값들(끝의 0 은 빼고). 이어 붙인 것 중 하나라도 넓은 문자열이면 모두 그 타입
+  const literal = (n: Node): { t: CType; units: number[] } => {
+    const parts =
+      n.type === "string_literal"
+        ? [n]
+        : n.namedChildren.filter((c) => c.type === "string_literal");
+    const prefix =
+      parts
+        .map((p) => p.text.slice(0, p.text.indexOf('"')))
+        .find((x) => x in PREFIX_TYPE) ?? "";
+    const body = (p: Node) => p.text.slice(p.text.indexOf('"') + 1, -1);
+    return prefix
+      ? {
+          t: PREFIX_TYPE[prefix],
+          units: parts.flatMap((p) => wideUnits(body(p), prefix === "u")),
+        }
+      : {
+          t: T.char,
+          units: Array.from(parts.map((p) => unquote(body(p))).join(""), (c) =>
+            c.charCodeAt(0),
+          ),
+        };
+  };
   const evalString = (str: string): Place => ({
     t: arr(T.char, str.length + 1),
     addr: strAddr(str),
     lv: true,
   });
+  const evalLiteral = (n: Node): Place => {
+    const { t, units } = literal(n);
+    if (t === T.char) return evalString(String.fromCharCode(...units));
+    const key = `${typeName(t)}:${units.join(",")}`;
+    let addr = strings.get(key);
+    if (addr === undefined) {
+      const at = arr(t, units.length + 1);
+      if (started) addr = staticAlloc(null, at);
+      else {
+        strTop = Math.ceil(strTop / t.size) * t.size;
+        addr = strTop;
+        strTop += at.size;
+      }
+      for (let i = 0; i <= units.length; i++)
+        store(null, addr + i * t.size, t, units[i] ?? 0);
+      strings.set(key, addr);
+    }
+    return { t: arr(t, units.length + 1), addr, lv: true };
+  };
   const strings = new Map<string, number>();
   const strAddr = (s: string) => {
     const known = strings.get(s);
@@ -1056,7 +1143,7 @@ export function run(
   // int a[] = … 의 크기: 문자열이면 글자 수 + 1, { } 면 가장 뒤 자리 + 1([5] = 1 처럼 자리를 정할 수 있다)
   const initCount = (init: Node) => {
     if (init.type === "string_literal" || init.type === "concatenated_string")
-      return literal(init).length + 1;
+      return literal(init).units.length + 1;
     let i = 0;
     let most = 0;
     for (const it of init.namedChildren) {
@@ -1077,10 +1164,10 @@ export function run(
       type.k === "array" &&
       (v.type === "string_literal" || v.type === "concatenated_string")
     ) {
-      const str = literal(v);
-      if (str.length > type.n) fail(n, "문자열이 배열보다 깁니다");
+      const { units } = literal(v);
+      if (units.length > type.n) fail(n, "문자열이 배열보다 깁니다");
       for (let i = 0; i < type.n; i++)
-        store(n, addr + i, T.char, i < str.length ? str.charCodeAt(i) : 0);
+        store(n, addr + i * type.of.size, type.of, units[i] ?? 0);
       return;
     }
     if (v.type === "initializer_list") {
@@ -1173,12 +1260,23 @@ export function run(
         const t = types.find(fits) ?? T.ulong;
         return { t, v: minus ? wrap(t, -v) : norm(v) };
       }
-      case "char_literal":
-        return { t: T.int, v: unquote(n.text.slice(1, -1)).charCodeAt(0) };
+      case "char_literal": {
+        const q = n.text.indexOf("'");
+        const prefix = n.text.slice(0, q);
+        const body = n.text.slice(q + 1, -1);
+        if (prefix in PREFIX_TYPE)
+          return {
+            t: PREFIX_TYPE[prefix],
+            v: wideUnits(body, prefix === "u")[0] ?? 0,
+          };
+        // char 는 부호가 있어 '\xff' 는 -1
+        const c = unquote(body).charCodeAt(0);
+        return { t: T.int, v: (c << 24) >> 24 };
+      }
       // 문자열 상수는 char 배열이다(sizeof "ab" 는 3, 쓰면 첫 글자 주소로 바뀐다)
       case "string_literal":
       case "concatenated_string":
-        return evalString(literal(n));
+        return evalLiteral(n);
       case "null":
         return { t: ptr(T.void), v: 0 };
       case "true":
@@ -1194,6 +1292,9 @@ export function run(
         if (e !== undefined) return { t: T.int, v: e };
         const fn = funcs.get(name);
         if (fn && !lookupMaybe(name)) return { t: fn.type, v: fn.addr };
+        const libAddr = LIBRARY_ADDR.get(name);
+        if (libAddr !== undefined && !lookupMaybe(name))
+          return { t: libType(name), v: libAddr };
         const stream = STREAMS[name];
         if (stream && !lookupMaybe(name)) return { t: ptr(FILE), v: stream };
         if (name === "__func__" && !lookupMaybe(name))
@@ -1413,9 +1514,6 @@ export function run(
     const args = field(n, "arguments")
       .namedChildren.filter((a): a is Node => !!a)
       .map((a) => rvalue(n, evalExpr(a)));
-    const arg = (i: number) =>
-      args[i] ?? fail(n, `${name}에 인자가 모자랍니다`);
-    const argN = (i: number) => num(arg(i).v);
     // 이름으로 부르면 표준 함수일 수 있다. 같은 이름의 변수나 직접 만든 함수가 있으면 그쪽
     const builtin =
       fnNode.type === "identifier" && !lookupMaybe(name) && !funcs.has(name);
@@ -1429,6 +1527,8 @@ export function run(
       const fv = rvalue(n, evalExpr(fnNode));
       const isFn =
         fv.t.k === "func" || (fv.t.k === "ptr" && fv.t.to.k === "func");
+      const lib = isFn ? LIBRARY[num(fv.v)] : undefined;
+      if (lib) return callLibrary(n, lib, args);
       const f = isFn ? byAddr.get(num(fv.v)) : undefined;
       if (!f)
         return fail(
@@ -1448,6 +1548,12 @@ export function run(
         );
       return invoke(f, args, n);
     }
+    return callLibrary(n, name, args);
+  }
+  function callLibrary(n: Node, name: string, args: Val[]): Val {
+    const arg = (i: number) =>
+      args[i] ?? fail(n, `${name}에 인자가 모자랍니다`);
+    const argN = (i: number) => num(arg(i).v);
     const lib = libCall(n, name, args);
     if (lib) return lib;
     switch (name) {
