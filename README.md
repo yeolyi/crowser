@@ -62,7 +62,7 @@ In the browser, use the worker build so long programs never block the UI:
 ```ts
 import { runC, releaseC } from "@yeolyi/crowser/browser";
 
-const result = await runC(code); // runs in a Web Worker
+const result = await runC(code, { limit: 20000 }); // runs in a Web Worker
 releaseC();                      // terminate the worker when you're done
 ```
 
@@ -113,9 +113,9 @@ type CVar = { name: string; type: string; addr: number; size: number; value: str
 
 Rebuilds any step from the changes. Keeps a full picture every 128 steps, so `at(i)` is fast in any order.
 
-### `runC(source, limit = 2000) → Promise<CResult & { seconds }>` · `releaseC()`
+### `runC(source, { limit = 2000, signal }?) → Promise<CResult & { seconds }>` · `releaseC()`
 
-The same as `run` but inside a Web Worker (`@yeolyi/crowser/browser`).
+The same as `run` but inside a Web Worker (`@yeolyi/crowser/browser`). Aborting `signal` kills the worker if that run is in progress, so even an infinite loop stops at once; other queued runs carry on in a fresh worker.
 
 ## What it catches
 

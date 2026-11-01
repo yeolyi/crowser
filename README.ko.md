@@ -62,7 +62,7 @@ trace.at(3);  // 3번째 단계의 { line, frames, globals, heap, out }
 ```ts
 import { runC, releaseC } from "@yeolyi/crowser/browser";
 
-const result = await runC(code); // Web Worker 에서 돈다
+const result = await runC(code, { limit: 20000 }); // Web Worker 에서 돈다
 releaseC();                      // 다 쓰면 워커를 내린다
 ```
 
@@ -113,9 +113,9 @@ type CVar = { name: string; type: string; addr: number; size: number; value: str
 
 바뀐 것에서 아무 단계의 모습을 다시 만듭니다. 128단계마다 전체 모습을 남겨 두어 어느 순서로 `at(i)`을 불러도 빠릅니다.
 
-### `runC(source, limit = 2000) → Promise<CResult & { seconds }>` · `releaseC()`
+### `runC(source, { limit = 2000, signal }?) → Promise<CResult & { seconds }>` · `releaseC()`
 
-`run`과 같고 Web Worker 안에서 돕니다(`@yeolyi/crowser/browser`).
+`run`과 같고 Web Worker 안에서 돕니다(`@yeolyi/crowser/browser`). `signal`로 그만두면 그 실행이 돌고 있던 워커를 내려, 끝나지 않는 반복도 바로 멈춥니다. 기다리던 다른 실행은 새 워커에서 이어 돕니다.
 
 ## 잡아 주는 실수
 

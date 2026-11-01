@@ -50,6 +50,14 @@ export function replay(steps: CChange[]) {
   });
   return {
     length: steps.length,
+    /** 처음부터 차례로(단계마다 바뀐 것 하나씩만 얹는다) */
+    *[Symbol.iterator](): Generator<CStep> {
+      let t = EMPTY;
+      for (const c of steps) {
+        t = apply(t, c);
+        yield t;
+      }
+    },
     at(i: number): CStep {
       const k = Math.floor(i / MARK);
       let t = marks[k];
