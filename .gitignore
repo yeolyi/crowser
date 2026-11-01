@@ -1,1 +1,4 @@
 test/.cache
+node_modules
+dist
+*.tgz

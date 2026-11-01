@@ -22,7 +22,7 @@ let failed = 0;
 
 for (const f of fs.readdirSync(path.join(here, "examples")).sort()) {
   const file = path.join(here, "examples", f);
-  execFileSync("clang", ["-std=c17", "-w", "-o", bin, file]);
+  execFileSync("clang", ["-std=c17", "-w", "-o", bin, file, "-lm"]);
   const want = execFileSync(bin).toString();
   const src = fs.readFileSync(file, "utf8");
   const r = run(src, { limit: 100_000 });

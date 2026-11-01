@@ -1,12 +1,57 @@
 {
-  "name": "@yeolyi/c",
-  "private": true,
-  "type": "module",
-  "exports": {
-    ".": "./src/index.ts",
-    "./browser": "./src/browser.ts"
+  "name": "crowser",
+  "version": "0.1.0",
+  "description": "Run C in the browser, step through every line, and catch memory bugs where they happen.",
+  "keywords": [
+    "c",
+    "interpreter",
+    "browser",
+    "education",
+    "visualization",
+    "debugger",
+    "step-through",
+    "memory-safety",
+    "c17"
+  ],
+  "homepage": "https://cs.yeolyi.com/lab/c",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yeolyi/crowser.git"
   },
+  "bugs": "https://github.com/yeolyi/crowser/issues",
+  "license": "MIT",
+  "author": "yeolyi",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./browser": {
+      "types": "./dist/browser.d.ts",
+      "default": "./dist/browser.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
-    "test": "node test/run.ts"
-  }
+    "build": "node scripts/build.ts",
+    "typecheck": "tsc",
+    "test": "node test/run.ts",
+    "test:suites": "node test/run.ts --suite",
+    "prepublishOnly": "npm run typecheck && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2",
+    "playwright": "1.64.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "packageManager": "pnpm@10.18.0"
 }

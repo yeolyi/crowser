@@ -1,6 +1,7 @@
 // 브라우저에서 C 를 돌린다. 워커 하나를 띄워 두고 요청을 차례로 보낸다
 import type { CResult } from "./interp.ts";
 import type { ToWorker } from "./worker.ts";
+import { workerUrl } from "./worker-url.ts";
 
 export * from "./interp.ts";
 
@@ -15,9 +16,7 @@ const waiting = new Map<number, (r: CRun) => void>();
 
 const start = () => {
   if (worker) return worker;
-  worker = new Worker(new URL("./worker.ts", import.meta.url), {
-    type: "module",
-  });
+  worker = new Worker(workerUrl(), { type: "module" });
   worker.onmessage = (
     e: MessageEvent<{ id: number; result: CResult; seconds: number }>,
   ) => {
