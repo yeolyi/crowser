@@ -81,8 +81,18 @@ function lex(src: string): Tok[] {
     toks.push({ k, v: src.slice(start, i), start, end: i, row: startRow });
   const quoted = (q: string) => {
     i++;
-    while (i < src.length && src[i] !== q && src[i] !== "\n")
-      i += src[i] === "\\" ? 2 : 1;
+    while (i < src.length && src[i] !== q && src[i] !== "\n") {
+      if (src[i] === "\\") {
+        const e = src.slice(i + 1, i + 10);
+        if (!ESCAPE.test(e))
+          throw new ParseError(
+            row,
+            `알 수 없는 이스케이프 \\${e[0] ?? ""} 입니다`,
+          );
+        i++;
+      }
+      i++;
+    }
     if (src[i] !== q)
       throw new ParseError(
         row,
@@ -155,6 +165,10 @@ const NUMBER = new RegExp(
     .map((r) => r.source)
     .join("|"),
 );
+
+// \ 뒤에 올 수 있는 것: 정해진 글자, 8진수, \x16진수, \u·\U 유니코드
+const ESCAPE =
+  /^(?:['"?\\abfnrtv0-7]|x[\da-fA-F]|u[\da-fA-F]{4}|U[\da-fA-F]{8})/;
 
 // ---------- 파서 ----------
 
@@ -232,6 +246,10 @@ const STD_TYPEDEFS = [
     `uint_fast${n}_t`,
   ]),
 ];
+
+// 지정자 묶음(표준 순서로 놓은 글)으로 될 수 있는 것
+const VALID_TYPES =
+  /^(?:void|_Bool|float|double|long double|(?:(?:signed|unsigned) )?(?:char|(?:short|long|long long)(?: int)?|int)|signed|unsigned)$/;
 
 const PREC: Record<string, number> = {
   "||": 1,
@@ -410,7 +428,19 @@ export function parse(src: string): Node {
         wordRow,
       );
       if (!sized && words.length > 1) fail(`타입이 둘입니다: ${text}`);
+      if (words.includes("_Complex"))
+        fail("복소수(_Complex)는 지원하지 않습니다");
+      if (!VALID_TYPES.test(text)) fail(`${text} 는 없는 타입입니다`);
     }
+    const storage = extras.filter(
+      (e) =>
+        (e.type === "typedef" || e.type === "storage_class_specifier") &&
+        !/^(inline|_Noreturn|_Thread_local)$/.test(e.text),
+    );
+    if (storage.length > 1)
+      fail(
+        `저장 부류는 하나만 씁니다(${storage.map((e) => e.text).join(", ")})`,
+      );
     return { type, extras, from };
   };
 
@@ -431,6 +461,7 @@ export function parse(src: string): Node {
         if (peek().k === "eof") fail("struct 의 } 가 없습니다");
         kids.push(fieldDecl());
       }
+      if (kids.length === 1) fail(`${kw} 에 멤버가 하나도 없습니다`);
       kids.push(expect("}"));
       body = make("field_declaration_list", b, kids);
     }
@@ -644,6 +675,13 @@ export function parse(src: string): Node {
           }
           const s = p;
           const { type, extras } = specifiers();
+          const storage = extras.find(
+            (e) =>
+              e.type === "typedef" ||
+              (e.type === "storage_class_specifier" && e.text !== "register"),
+          );
+          if (storage)
+            fail(`매개변수에는 ${storage.text} 를 붙일 수 없습니다`, toks[s]);
           if (!type) {
             if (peek().k === "id")
               fail(
@@ -801,6 +839,7 @@ export function parse(src: string): Node {
   const initList = (): Node => {
     const from = p;
     const kids: Node[] = [expect("{")];
+    if (is("}")) fail("빈 { } 초기화는 C23 부터입니다. { 0 } 을 씁니다");
     while (!is("}")) {
       const s = p;
       const designators: Kid[] = [];
