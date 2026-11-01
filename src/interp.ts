@@ -513,7 +513,8 @@ type Binding = {
   static?: true;
 };
 
-const hex = (v: number) => `0x${v.toString(16)}`;
+// 포인터는 64비트 무늬를 부호 있는 수로 든다((void *)-1 이 -1). 찍을 땐 부호 없이
+const hex = (v: Num) => `0x${BigInt.asUintN(64, big(v)).toString(16)}`;
 
 // 정수 값. 64비트 정수가 2^53 을 넘으면 JS 수로는 끝자리가 틀려 bigint 로 둔다. 그 안쪽이면 늘 number 라
 // (norm) 두 값의 표현이 다르면 값도 다르고, === 비교가 그대로 맞는다
@@ -770,7 +771,7 @@ function execute(
       );
       return norm(t.signed ? BigInt.asIntN(t.bits, v) : v);
     }
-    if (t.k === "ptr") return Number(mem.getBigUint64(addr, true));
+    if (t.k === "ptr") return Number(mem.getBigInt64(addr, true));
     if (t.k === "float")
       return t.size === 4
         ? mem.getFloat32(addr, true)
@@ -836,6 +837,8 @@ function execute(
           return t.signed ? (v << 24) >> 24 : v & 0xff;
       }
     if (t.k === "float") return t.size === 4 ? Math.fround(num(v)) : num(v);
+    if (t.k === "ptr")
+      return typeof v === "bigint" ? Number(BigInt.asIntN(64, v)) : v;
     if (t.k !== "int") return num(v);
     if (t.name === T.bool.name) return truth(v) ? 1 : 0;
     if (t.bits !== undefined)
@@ -2348,7 +2351,7 @@ function execute(
     if (t.k === "ptr")
       return (n, a) => {
         check(n, a, 8);
-        return mem.getUint32(a, true) + mem.getUint32(a + 4, true) * 2 ** 32;
+        return mem.getUint32(a, true) + mem.getInt32(a + 4, true) * 2 ** 32;
       };
     const signed = t.k === "int" && t.signed;
     if (t.size === 1)
@@ -3917,7 +3920,7 @@ function execute(
             numeric = false;
             break;
           case "p":
-            s = hex(num(a.v));
+            s = hex(a.v);
             numeric = false;
             break;
           default:
@@ -5296,7 +5299,7 @@ function execute(
   const uninit = (t: CType): Num => {
     if (t.k === "float")
       return t.size === 4 ? cd.getFloat32(0, true) : cd.getFloat64(0, true);
-    if (t.k === "ptr") return Number(cd.getBigUint64(0, true));
+    if (t.k === "ptr") return Number(cd.getBigInt64(0, true));
     const signed = t.k === "int" && t.signed;
     switch (t.size) {
       case 1:
@@ -5403,7 +5406,7 @@ function execute(
     },
     lp: (n: Node, a: number) => {
       check(n, a, 8);
-      return mem.getUint32(a, true) + mem.getUint32(a + 4, true) * 2 ** 32;
+      return mem.getUint32(a, true) + mem.getInt32(a + 4, true) * 2 ** 32;
     },
     lv: (n: Node, a: number, t: CType) => load(n, a, t),
     s1: (n: Node, a: number, v: number) => {
@@ -5585,7 +5588,7 @@ function execute(
               : `Math.fround(num(${c}))`;
         return p ? c : `num(${c})`;
       }
-      if (to.k === "ptr") return p ? c : `num(${c})`;
+      if (to.k === "ptr") return p ? c : `W(${K(to)}, ${c})`;
       return `W(${K(to)}, ${c})`;
     };
     const truthy = (r: R) => `(${r.c} !== 0)`;

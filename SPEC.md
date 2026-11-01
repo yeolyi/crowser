@@ -24,6 +24,7 @@ Memory is a single 16 MB byte array. Each region starts at a fixed address, so y
 - Heap blocks are laid out back to back in 16-byte units, and freed space is never reused. Addresses never overlap, so a block is never mistaken for another.
 - Addresses are the same on every run. Real systems randomize them for security; here the same code always gives the same addresses.
 - Uninitialized locals and `malloc`'d memory are filled with `0xcd`. Read as an `int`, that is `-842150451`. If you see it, something was read before it was written.
+- Pointer values are held in JavaScript numbers (doubles). Real addresses and sentinels like `(void *)-1` are exact, but bit patterns above 2⁵³ (an uninitialized pointer's `0xcdcdcdcdcdcdcdcd`, say) lose their low bits, and ordering comparisons between such pointers may differ from clang. Dereferencing one stops the program.
 - Sizes and layout match 64-bit C: `char` 1, `short` 2, `int` and `float` 4, `long`, `double` and pointers 8 bytes. Struct padding, bit-field placement and `sizeof` match too. `long double` is the same 8 bytes as `double` (as on Apple silicon).
 
 ## Not supported
