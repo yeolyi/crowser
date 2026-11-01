@@ -17,12 +17,15 @@ const HEAP_END = STACK_TOP - 0x100000;
 const OPS_LIMIT = 20_000_000;
 
 // ---------- 타입 ----------
+// bits: 비트 필드의 폭. 그 필드는 offset 부터 size 바이트(선언한 타입 크기)를 읽어 shift 비트 위의 bits 개를 쓴다
 type IntType = {
   k: "int";
   size: number;
   align: number;
   signed: boolean;
   name: string;
+  bits?: number;
+  shift?: number;
 };
 type PtrType = { k: "ptr"; to: CType; size: 8; align: 8 };
 type ArrayType = {
@@ -32,7 +35,8 @@ type ArrayType = {
   size: number;
   align: number;
 };
-type Field = { name: string; type: CType; offset: number };
+// skip: { } 초기화에서 차례로 채우지 않는 필드(이름 없는 비트 필드, 이름 없는 union 의 둘째 멤버부터)
+type Field = { name: string; type: CType; offset: number; skip?: boolean };
 type StructType = {
   k: "struct";
   name: string;
@@ -427,7 +431,9 @@ type Tree = {
   children: (Tree | null)[];
 };
 function findError<N extends Tree>(n: N): N | null {
-  if (n.type === "ERROR" || n.isMissing) return n;
+  // 이름 없는 비트 필드(int : 3)를 tree-sitter 는 빠진 필드 이름으로 읽는다
+  if (n.type === "ERROR" || (n.isMissing && n.type !== "field_identifier"))
+    return n;
   for (const c of n.children) {
     if (!c) continue;
     const e = findError(c as N);
@@ -463,6 +469,7 @@ export function run(
   const structs = new Map<string, StructType>();
   const typedefs = new Map<string, CType>();
   const enums = new Map<string, number>();
+  const enumTags = new Map<string, CType>();
   const funcs = new Map<string, Func>();
   const byAddr = new Map<number, Func>();
   const globals = new Map<string, Binding>();
@@ -548,9 +555,26 @@ export function run(
         );
     }
   };
+  const unitOf = (addr: number, size: number) =>
+    size === 8
+      ? mem.getBigUint64(addr, true)
+      : BigInt(
+          size === 1
+            ? mem.getUint8(addr)
+            : size === 2
+              ? mem.getUint16(addr, true)
+              : mem.getUint32(addr, true),
+        );
   const load = (n: Node | null, addr: number, t: CType): Num => {
     if (dry) return 0;
     check(n, addr, t.size);
+    if (t.k === "int" && t.bits !== undefined) {
+      const v = BigInt.asUintN(
+        t.bits,
+        unitOf(addr, t.size) >> BigInt(t.shift ?? 0),
+      );
+      return norm(t.signed ? BigInt.asIntN(t.bits, v) : v);
+    }
     if (t.k === "ptr") return Number(mem.getBigUint64(addr, true));
     if (t.k === "float")
       return t.size === 4
@@ -579,6 +603,12 @@ export function run(
         ? mem.setFloat32(addr, num(v), true)
         : mem.setFloat64(addr, num(v), true);
     if (t.k !== "int") return fail(n, `${typeName(t)} 에는 쓸 수 없습니다`);
+    if (t.bits !== undefined) {
+      const shift = BigInt(t.shift ?? 0);
+      const mask = ((1n << BigInt(t.bits)) - 1n) << shift;
+      const unit = (unitOf(addr, t.size) & ~mask) | ((big(v) << shift) & mask);
+      return store(n, addr, { ...t, bits: undefined }, norm(unit));
+    }
     if (t.size === 8)
       return mem.setBigUint64(addr, BigInt.asUintN(64, big(v)), true);
     const x = typeof v === "bigint" ? Number(BigInt.asUintN(32, v)) : v;
@@ -601,7 +631,14 @@ export function run(
   function wrap(t: CType, v: Num): Num {
     if (t.k === "float") return t.size === 4 ? Math.fround(num(v)) : num(v);
     if (t.k !== "int") return num(v);
-    if (t === T.bool) return truth(v) ? 1 : 0;
+    if (t === T.bool || (t.bits && t.name === T.bool.name))
+      return truth(v) ? 1 : 0;
+    if (t.bits !== undefined)
+      return norm(
+        t.signed
+          ? BigInt.asIntN(t.bits, big(v))
+          : BigInt.asUintN(t.bits, big(v)),
+      );
     if (t.size === 8) {
       if (typeof v === "number") {
         const x = Math.trunc(v);
@@ -687,26 +724,34 @@ export function run(
         return st;
       }
       case "enum_specifier": {
+        // 값이 모두 0 이상인 enum 은 unsigned int, 음수가 있으면 int(gcc·clang 과 같게). 상수 자체는 int
+        const name = node.childForFieldName("name")?.text;
+        const key = `enum ${name}`;
         const body = node.childForFieldName("body");
-        if (body) {
-          let next = 0;
-          for (const e of body.namedChildren) {
-            if (!e || e.type !== "enumerator") continue;
-            const v = e.childForFieldName("value");
-            if (v) next = constEval(v);
-            const scope = frame()?.scopes.at(-1);
-            const name = field(e, "name").text;
-            if (scope)
-              scope.set(name, {
-                addr: 0,
-                type: T.int,
-                kind: "enum",
-                value: next++,
-              });
-            else enums.set(name, next++);
-          }
+        if (!body)
+          return (
+            (name && (findScoped(key)?.type ?? enumTags.get(key))) || T.uint
+          );
+        const scope = frame()?.scopes.at(-1);
+        let next = 0;
+        let negative = false;
+        for (const e of body.namedChildren) {
+          if (!e || e.type !== "enumerator") continue;
+          const v = e.childForFieldName("value");
+          if (v) next = constEval(v);
+          if (next < 0) negative = true;
+          const c = field(e, "name").text;
+          if (scope)
+            scope.set(c, { addr: 0, type: T.int, kind: "enum", value: next });
+          else enums.set(c, next);
+          next++;
         }
-        return T.int;
+        const t = negative ? T.int : T.uint;
+        if (name) {
+          if (scope) scope.set(key, { addr: 0, type: t, kind: "tag" });
+          else enumTags.set(key, t);
+        }
+        return t;
       }
       default:
         return fail(node, `지원하지 않는 타입 ${node.type}`);
@@ -735,42 +780,92 @@ export function run(
     else structs.set(key, st);
     return st;
   };
+  // 64비트 리눅스(System V)의 배치: 비트 필드는 선언한 타입 크기의 칸 안에 들어가면 이어 붙이고,
+  // 칸 경계를 넘으면 다음 칸에서 시작한다. 폭 0 은 다음 칸으로 넘기고, 이름 없는 비트 필드는 정렬에 셈하지 않는다
   const defineStruct = (st: StructType, body: Node) => {
     const fields: Field[] = [];
-    let off = 0;
+    let bit = 0;
     let align = 1;
     let size = 0;
     for (const fd of body.namedChildren) {
       if (!fd || fd.type !== "field_declaration") continue;
       const b = typeOf(field(fd, "type"));
-      const decls = fd.childrenForFieldName("declarator");
+      const decls = [...fd.childrenForFieldName("declarator")];
       // 이름 없는 struct·union 멤버: 그 필드들이 바깥 struct 의 필드가 된다
       if (!decls.length && b.k === "struct") {
-        off = st.union ? 0 : Math.ceil(off / b.align) * b.align;
-        for (const f of b.fields ?? [])
-          fields.push({ ...f, offset: off + f.offset });
+        const off = st.union ? 0 : Math.ceil(bit / 8 / b.align) * b.align;
+        let first = true;
+        for (const f of b.fields ?? []) {
+          fields.push({
+            ...f,
+            offset: off + f.offset,
+            skip: f.skip || (b.union && !first),
+          });
+          if (!f.skip) first = false;
+        }
         if (st.union) size = Math.max(size, b.size);
-        else off += b.size;
+        else bit = (off + b.size) * 8;
         align = Math.max(align, b.align);
         continue;
       }
+      // 선언자마다 바로 뒤에 오는 : 폭. unsigned : 3 처럼 선언자가 없으면 이름 없는 필드 하나
+      if (!decls.length) {
+        const clause = fd.namedChildren.find(
+          (c) => c.type === "bitfield_clause",
+        );
+        if (clause) decls.push(clause);
+      }
+      const widths = new Map<Node, number>();
+      let last: Node | null = null;
+      for (const c of fd.children) {
+        if (decls.includes(c)) last = c;
+        if (c.type === "bitfield_clause" && last)
+          widths.set(
+            last,
+            constEval(c.namedChildren[0] ?? fail(c, "폭이 없습니다")),
+          );
+      }
       for (const d of decls) {
         if (!d) continue;
-        const { name, type } = declare(b, d);
-        if (st.union) {
-          fields.push({ name, type, offset: 0 });
-          size = Math.max(size, type.size);
-        } else {
-          off = Math.ceil(off / type.align) * type.align;
+        const width = widths.get(d);
+        if (width === undefined) {
+          const { name, type } = declare(b, d);
+          const off = st.union
+            ? 0
+            : Math.ceil(bit / 8 / type.align) * type.align;
           fields.push({ name, type, offset: off });
-          off += type.size;
+          if (st.union) size = Math.max(size, type.size);
+          else bit = (off + type.size) * 8;
+          align = Math.max(align, type.align);
+          continue;
         }
-        align = Math.max(align, type.align);
+        if (b.k !== "int") return fail(d, "비트 필드는 정수 타입이어야 합니다");
+        if (width > b.size * 8) fail(d, "비트 필드가 타입보다 넓습니다");
+        const name = d.type === "bitfield_clause" ? "" : d.text;
+        const unit = b.size * 8;
+        if (
+          width === 0 ||
+          (!st.union &&
+            Math.floor(bit / unit) !== Math.floor((bit + width - 1) / unit))
+        )
+          bit = Math.ceil(bit / unit) * unit;
+        if (width === 0) continue;
+        const offset = st.union ? 0 : Math.floor(bit / unit) * b.size;
+        const shift = st.union ? 0 : bit - offset * 8;
+        fields.push({
+          name,
+          type: { ...b, bits: width, shift },
+          offset,
+          skip: !name,
+        });
+        if (st.union) size = Math.max(size, Math.ceil(width / 8));
+        else bit += width;
+        if (name) align = Math.max(align, b.align);
       }
     }
     st.fields = fields;
     st.align = align;
-    st.size = Math.ceil((st.union ? size : off) / align) * align;
+    st.size = Math.ceil((st.union ? size : Math.ceil(bit / 8)) / align) * align;
   };
   // 선언자를 풀어 이름과 타입을 얻는다. 바깥 선언자부터 타입을 감싸며 안으로 들어간다:
   // int *a[3] 은 [3] 이 바깥이라 (int * 의 배열 3), int (*a)[3] 은 * 가 바깥이라 (int[3] 을 가리키는 포인터).
@@ -879,6 +974,21 @@ export function run(
     if (x.t.k === "array") return { t: ptr(x.t.of), v: x.addr };
     if (x.t.k === "struct") return { t: x.t, v: x.addr, agg: true };
     if (x.t.k === "func") return { t: x.t, v: x.addr };
+    // 비트 필드의 값은 int 로 읽는다(폭이 int 보다 넓으면 선언한 타입)
+    if (x.t.k === "int" && x.t.bits !== undefined) {
+      const { bits, signed, size } = x.t;
+      const t =
+        bits < 32 || (bits === 32 && signed)
+          ? T.int
+          : bits === 32
+            ? T.uint
+            : size === 8
+              ? signed
+                ? T.long
+                : T.ulong
+              : T.int;
+      return { t, v: load(n, x.addr, x.t) };
+    }
     return { t: x.t, v: load(n, x.addr, x.t) };
   };
 
@@ -1140,30 +1250,48 @@ export function run(
     store(n, place.addr, place.t, wrap(place.t, val.v));
   };
 
-  // int a[] = … 의 크기: 문자열이면 글자 수 + 1, { } 면 가장 뒤 자리 + 1([5] = 1 처럼 자리를 정할 수 있다)
-  const initCount = (init: Node) => {
+  // int a[] = … 의 크기: 문자열이면 글자 수 + 1, { } 면 채운 원소 수(중괄호를 생략한 값, [5] = 1 처럼 정한 자리까지 셈한다)
+  const initCount = (init: Node, of: CType) => {
     if (init.type === "string_literal" || init.type === "concatenated_string")
       return literal(init).units.length + 1;
-    let i = 0;
-    let most = 0;
-    for (const it of init.namedChildren) {
-      if (it.type === "comment") continue;
-      if (it.type === "initializer_pair") {
-        const des = field(it, "designator");
-        if (des.type === "subscript_designator" && des.namedChildren[0])
-          i = constEval(des.namedChildren[0]);
-      }
-      most = Math.max(most, ++i);
+    dry++;
+    try {
+      return fillList(init, 0, arr(of, 0), stmts(init), { i: 0 }, true);
+    } finally {
+      dry--;
     }
-    return most;
+  };
+
+  const isString = (v: Node) =>
+    v.type === "string_literal" || v.type === "concatenated_string";
+  // struct 에서 { } 의 값을 차례로 받는 필드. union 은 첫 필드만
+  const inOrder = (t: StructType) => {
+    const fs = (t.fields ?? []).filter((f) => !f.skip);
+    return t.union ? fs.slice(0, 1) : fs;
+  };
+  // .a.b 나 [1].x 처럼 이어진 지정자를 따라 들어간 자리
+  const designate = (ds: Node[], addr: number, t: CType) => {
+    for (const d of ds) {
+      if (d.type === "subscript_designator" && t.k === "array") {
+        addr +=
+          constEval(d.namedChildren[0] ?? fail(d, "자리가 없습니다")) *
+          t.of.size;
+        t = t.of;
+      } else if (d.type === "field_designator" && t.k === "struct") {
+        const name = d.text.replace(/^\./, "");
+        const f =
+          t.fields?.find((x) => x.name === name) ??
+          fail(d, `${name} 필드가 없습니다`);
+        addr += f.offset;
+        t = f.type;
+      } else fail(d, "초기화 자리를 읽지 못했습니다");
+    }
+    return { addr, t };
   };
 
   // 초기화: 배열·struct 는 { … } 로, 나머지는 식으로
   const initialize = (n: Node, addr: number, type: CType, v: Node) => {
-    if (
-      type.k === "array" &&
-      (v.type === "string_literal" || v.type === "concatenated_string")
-    ) {
+    if (type.k === "array" && isString(v)) {
       const { units } = literal(v);
       if (units.length > type.n) fail(n, "문자열이 배열보다 깁니다");
       for (let i = 0; i < type.n; i++)
@@ -1171,51 +1299,98 @@ export function run(
       return;
     }
     if (v.type === "initializer_list") {
-      const items = v.namedChildren.filter((x): x is Node => !!x);
-      for (let i = 0; i < type.size; i++) mem.setUint8(addr + i, 0);
-      if (type.k === "array") {
-        // [2] = 5 처럼 자리를 지정하면 그 다음부터 이어 센다
-        let i = 0;
-        for (const it of items) {
-          let value = it;
-          if (it.type === "initializer_pair") {
-            const des = field(it, "designator");
-            if (des.type !== "subscript_designator")
-              fail(it, "배열 초기화의 자리는 [n] 으로 씁니다");
-            i = constEval(des.namedChildren[0] ?? fail(des, "자리가 없습니다"));
-            value = field(it, "value");
-          }
-          if (i >= type.n) fail(it, "초기화 값이 배열보다 많습니다");
-          initialize(n, addr + i * type.of.size, type.of, value);
-          i++;
-        }
-        return;
-      }
-      if (type.k === "struct" && type.fields) {
-        let i = 0;
-        for (const it of items) {
-          if (it.type === "initializer_pair") {
-            const des = field(it, "designator").text.replace(/^\./, "");
-            const fi = type.fields.findIndex((f) => f.name === des);
-            if (fi < 0) fail(it, `${des} 필드가 없습니다`);
-            const f = type.fields[fi];
-            initialize(n, addr + f.offset, f.type, field(it, "value"));
-            i = fi + 1;
-          } else {
-            const f =
-              type.fields[i++] ?? fail(it, "초기화 값이 필드보다 많습니다");
-            initialize(n, addr + f.offset, f.type, it);
-          }
-        }
-        return;
-      }
-      const first = items[0];
-      if (first)
-        assign(n, { t: type, addr, lv: true }, rvalue(n, evalExpr(first)));
+      if (!dry) for (let i = 0; i < type.size; i++) mem.setUint8(addr + i, 0);
+      fillList(n, addr, type, stmts(v), { i: 0 }, true);
       return;
     }
     assign(n, { t: type, addr, lv: true }, rvalue(n, evalExpr(v)));
   };
+  // { } 안의 값을 items[cur.i] 부터 차례로 type 에 채운다. braced 가 아니면 중괄호를 생략한 안쪽 집합체라
+  // 자리가 다 차면 남은 값은 바깥에 돌려준다. 배열이면 채운 원소 수를 돌려준다
+  function fillList(
+    n: Node,
+    addr: number,
+    type: CType,
+    items: Node[],
+    cur: { i: number },
+    braced: boolean,
+  ): number {
+    // 하나를 채운다. 안쪽이 집합체인데 { } 없이 값이 오면 그 값부터 안쪽을 채운다
+    const one = (at: number, t: CType) => {
+      const it = items[cur.i];
+      const elided =
+        it.type !== "initializer_list" &&
+        ((t.k === "array" && !isString(it)) ||
+          (t.k === "struct" && typeOnly(it).k !== "struct"));
+      if (elided) fillList(n, at, t, items, cur, false);
+      else {
+        initialize(n, at, t, it);
+        cur.i++;
+      }
+    };
+    if (type.k === "array") {
+      let i = 0;
+      let most = 0;
+      while (cur.i < items.length) {
+        const it = items[cur.i];
+        if (it.type === "initializer_pair") {
+          if (!braced) break;
+          const [d, ...rest] = it.childrenForFieldName("designator");
+          if (d?.type !== "subscript_designator")
+            fail(it, "배열 초기화의 자리는 [n] 으로 씁니다");
+          i = constEval(d.namedChildren[0] ?? fail(d, "자리가 없습니다"));
+          if (type.n && i >= type.n) fail(it, "초기화 값이 배열보다 많습니다");
+          const at = designate(rest, addr + i * type.of.size, type.of);
+          initialize(n, at.addr, at.t, field(it, "value"));
+          cur.i++;
+        } else {
+          if (type.n && i >= type.n) {
+            if (braced) fail(it, "초기화 값이 배열보다 많습니다");
+            break;
+          }
+          one(addr + i * type.of.size, type.of);
+        }
+        most = Math.max(most, ++i);
+        if (!braced && type.n && i >= type.n) break;
+      }
+      return most;
+    }
+    if (type.k === "struct" && type.fields) {
+      const order = inOrder(type);
+      let fi = 0;
+      while (cur.i < items.length) {
+        const it = items[cur.i];
+        if (it.type === "initializer_pair") {
+          if (!braced) break;
+          const [d, ...rest] = it.childrenForFieldName("designator");
+          const name = d?.text.replace(/^\./, "") ?? "";
+          const f =
+            type.fields.find((x) => x.name === name) ??
+            fail(it, `${name} 필드가 없습니다`);
+          fi = order.indexOf(f) + 1 || order.length;
+          const at = designate(rest, addr + f.offset, f.type);
+          initialize(n, at.addr, at.t, field(it, "value"));
+          cur.i++;
+          continue;
+        }
+        const f = order[fi++];
+        if (!f) {
+          if (braced) fail(it, "초기화 값이 필드보다 많습니다");
+          break;
+        }
+        one(addr + f.offset, f.type);
+        if (!braced && fi >= order.length) break;
+      }
+      return 0;
+    }
+    // { 5 } 처럼 중괄호 안의 값 하나
+    const first = items[cur.i];
+    if (first) {
+      initialize(n, addr, type, first);
+      cur.i++;
+    }
+    return 0;
+  }
 
   // 지금 실행 중인 곳(해석기 자체가 멈출 때 그 줄을 알리려고)
   let here: Node | null = null;
@@ -1470,7 +1645,7 @@ export function run(
         // (Point){1, 2}: 이름 없는 변수를 지금 함수의 스택에 잡아 초기화한다
         let t = typeOfDescriptor(field(n, "type"));
         const init = field(n, "value");
-        if (t.k === "array" && !t.n) t = arr(t.of, initCount(init));
+        if (t.k === "array" && !t.n) t = arr(t.of, initCount(init, t.of));
         const addr = frames.length ? alloca(n, t) : staticAlloc(n, t);
         initialize(n, addr, t, init);
         return { t, addr, lv: true };
@@ -2247,7 +2422,7 @@ export function run(
       const init =
         d.type === "init_declarator" ? d.childForFieldName("value") : null;
       if (type.k === "array" && !type.n && init)
-        type = arr(type.of, initCount(init));
+        type = arr(type.of, initCount(init, type.of));
       // static 지역 변수는 전역 자리에 한 번만 잡고 처음 한 번만 초기화한다
       if (isStatic(n)) {
         if (d.memo === undefined) {
@@ -2638,7 +2813,7 @@ export function run(
           const init =
             d.type === "init_declarator" ? d.childForFieldName("value") : null;
           if (type.k === "array" && !type.n && init)
-            type = arr(type.of, initCount(init));
+            type = arr(type.of, initCount(init, type.of));
           // 같은 전역을 여러 번 선언할 수 있다(extern int a; int a = 1;). 크기가 정해지는 선언에서 자리를 잡는다
           // 정의가 없거나, 아직 크기를 모르는 struct 의 extern 선언은 자리를 정의에서 잡는다
           if (
