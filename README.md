@@ -7,9 +7,9 @@
 Run C17 in the browser, record the stack and heap at every line,<br>
 and stop at the exact line where memory goes wrong.
 
-[![npm](https://img.shields.io/npm/v/crowser?color=58a6ff&label=npm)](https://www.npmjs.com/package/crowser)
+[![npm](https://img.shields.io/npm/v/%40yeolyi%2Fcrowser?color=58a6ff&label=npm)](https://www.npmjs.com/package/@yeolyi/crowser)
 [![CI](https://github.com/yeolyi/crowser/actions/workflows/ci.yml/badge.svg)](https://github.com/yeolyi/crowser/actions/workflows/ci.yml)
-[![license](https://img.shields.io/npm/l/crowser?color=7ee787)](./LICENSE)
+[![license](https://img.shields.io/npm/l/%40yeolyi%2Fcrowser?color=7ee787)](./LICENSE)
 [![dependencies](https://img.shields.io/badge/dependencies-0-d2a8ff)](./package.json)
 
 English · [한국어](./README.ko.md)
@@ -33,13 +33,13 @@ Real C is fast and silent: an out-of-bounds write or a use-after-free just corru
 ## Install
 
 ```sh
-npm install crowser
+npm install @yeolyi/crowser
 ```
 
 ## Quick start
 
 ```ts
-import { run } from "crowser";
+import { run } from "@yeolyi/crowser";
 
 const { out, steps, error } = run(`
 #include <stdio.h>
@@ -57,7 +57,7 @@ steps.length; // 10: one snapshot per executed line
 In the browser, use the worker build so long programs never block the UI:
 
 ```ts
-import { runC, releaseC } from "crowser/browser";
+import { runC, releaseC } from "@yeolyi/crowser/browser";
 
 const result = await runC(code); // runs in a Web Worker
 releaseC();                      // terminate the worker when you're done
@@ -97,7 +97,7 @@ type CVar = { name: string; type: string; addr: number; size: number; value: str
 
 ### `runC(source, limit = 2000) → Promise<CResult & { seconds }>` · `releaseC()`
 
-The same as `run` but inside a Web Worker (`crowser/browser`).
+The same as `run` but inside a Web Worker (`@yeolyi/crowser/browser`).
 
 ## What it catches
 

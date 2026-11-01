@@ -7,9 +7,9 @@
 C17 코드를 브라우저에서 돌리면서 줄마다 스택과 힙을 기록하고,<br>
 메모리를 잘못 건드린 바로 그 줄에서 멈춥니다.
 
-[![npm](https://img.shields.io/npm/v/crowser?color=58a6ff&label=npm)](https://www.npmjs.com/package/crowser)
+[![npm](https://img.shields.io/npm/v/%40yeolyi%2Fcrowser?color=58a6ff&label=npm)](https://www.npmjs.com/package/@yeolyi/crowser)
 [![CI](https://github.com/yeolyi/crowser/actions/workflows/ci.yml/badge.svg)](https://github.com/yeolyi/crowser/actions/workflows/ci.yml)
-[![license](https://img.shields.io/npm/l/crowser?color=7ee787)](./LICENSE)
+[![license](https://img.shields.io/npm/l/%40yeolyi%2Fcrowser?color=7ee787)](./LICENSE)
 [![dependencies](https://img.shields.io/badge/dependencies-0-d2a8ff)](./package.json)
 
 [English](./README.md) · 한국어
@@ -33,13 +33,13 @@ C17 코드를 브라우저에서 돌리면서 줄마다 스택과 힙을 기록�
 ## 설치
 
 ```sh
-npm install crowser
+npm install @yeolyi/crowser
 ```
 
 ## 빠른 시작
 
 ```ts
-import { run } from "crowser";
+import { run } from "@yeolyi/crowser";
 
 const { out, steps, error } = run(`
 #include <stdio.h>
@@ -57,7 +57,7 @@ steps.length; // 10: 실행한 줄마다 하나씩
 브라우저에선 워커 판을 쓰면 오래 도는 프로그램도 화면을 멈추지 않습니다.
 
 ```ts
-import { runC, releaseC } from "crowser/browser";
+import { runC, releaseC } from "@yeolyi/crowser/browser";
 
 const result = await runC(code); // Web Worker 에서 돈다
 releaseC();                      // 다 쓰면 워커를 내린다
@@ -97,7 +97,7 @@ type CVar = { name: string; type: string; addr: number; size: number; value: str
 
 ### `runC(source, limit = 2000) → Promise<CResult & { seconds }>` · `releaseC()`
 
-`run`과 같고 Web Worker 안에서 돕니다(`crowser/browser`).
+`run`과 같고 Web Worker 안에서 돕니다(`@yeolyi/crowser/browser`).
 
 ## 잡아 주는 실수
 
