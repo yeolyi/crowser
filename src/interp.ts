@@ -147,7 +147,82 @@ export function typeName(t: CType): string {
   }
 }
 
-// printf 의 %f·%e·%g
+// 실수를 정수 × 2^e 로 나눈다(유한한 수만)
+function decompose(x: number): [bigint, number] {
+  const dv = new DataView(new ArrayBuffer(8));
+  dv.setFloat64(0, x);
+  const bits = dv.getBigUint64(0);
+  const sign = bits >> 63n ? -1n : 1n;
+  const exp = Number((bits >> 52n) & 0x7ffn);
+  const frac = bits & ((1n << 52n) - 1n);
+  return exp === 0
+    ? [sign * frac, -1074]
+    : [sign * (frac | (1n << 52n)), exp - 1075];
+}
+// m × 2^e 를 가장 가까운 double 로(반이면 짝수 쪽)
+function toDouble(m: bigint, e: number): number {
+  if (m === 0n) return 0;
+  const neg = m < 0n;
+  let a = neg ? -m : m;
+  // 53비트 정밀도, 그리고 2^-1074 보다 작은 자리는 double 에 없다
+  const drop = Math.max(a.toString(2).length - 53, -1074 - e);
+  if (drop > 0) {
+    const D = BigInt(drop);
+    const q = a >> D;
+    const r = a - (q << D);
+    const half = 1n << (D - 1n);
+    a = r > half || (r === half && q & 1n) ? q + 1n : q;
+    e += drop;
+  }
+  let v = Number(a);
+  for (; e > 1000; e -= 1000) v *= 2 ** 1000;
+  for (; e < -1000; e += 1000) v *= 2 ** -1000;
+  v *= 2 ** e;
+  return neg ? -v : v;
+}
+// x × y + z 를 한 번만 반올림한다(C 의 fma)
+function fma(x: number, y: number, z: number): number {
+  const p = x * y;
+  if (!Number.isFinite(p) || !Number.isFinite(z) || p === 0 || z === 0)
+    return p + z;
+  const [mx, ex] = decompose(x);
+  const [my, ey] = decompose(y);
+  const [mz, ez] = decompose(z);
+  const ep = ex + ey;
+  const e = Math.min(ep, ez);
+  const sum = ((mx * my) << BigInt(ep - e)) + (mz << BigInt(ez - e));
+  return sum === 0n ? p + z : toDouble(sum, e);
+}
+// %a: 0x1.8p+3 처럼 16진 가수와 2진 지수. p < 0 이면 정확히 나타내는 만큼
+function hexFloatText(a: number, p: number): string {
+  if (a === 0) return `0x0${p > 0 ? `.${"0".repeat(p)}` : ""}p+0`;
+  let [m, e] = decompose(a);
+  // 맨 앞 1 뒤에 52비트가 오게 맞춘다(아주 작은 수도 1.xxx 로)
+  const len = m.toString(2).length;
+  m <<= BigInt(53 - len);
+  e -= 53 - len;
+  let frac = m & ((1n << 52n) - 1n);
+  let lead = 1n;
+  if (p >= 0 && p < 13) {
+    const D = BigInt(52 - p * 4);
+    const q = frac >> D;
+    const r = frac - (q << D);
+    const half = D ? 1n << (D - 1n) : 0n;
+    frac = D && (r > half || (r === half && q & 1n)) ? q + 1n : q;
+    if (frac >> BigInt(p * 4)) {
+      lead += 1n;
+      frac = 0n;
+    }
+  }
+  let digits =
+    p === 0 ? "" : frac.toString(16).padStart(p > 0 && p < 13 ? p : 13, "0");
+  if (p < 0) digits = digits.replace(/0+$/, "");
+  else if (p > 13) digits = digits.padEnd(p, "0");
+  const exp = e + 52;
+  return `0x${lead}${digits ? `.${digits}` : ""}p${exp < 0 ? "-" : "+"}${Math.abs(exp)}`;
+}
+
+// printf 의 %f·%e·%g·%a
 function formatFloat(v: number, c: string, p: number, flags: string): string {
   const sign =
     v < 0 || Object.is(v, -0)
@@ -158,7 +233,7 @@ function formatFloat(v: number, c: string, p: number, flags: string): string {
           ? " "
           : "";
   const a = Math.abs(v);
-  const upper = c === "F" || c === "E" || c === "G";
+  const upper = c === "F" || c === "E" || c === "G" || c === "A";
   let s: string;
   if (!Number.isFinite(a)) s = Number.isNaN(a) ? "nan" : "inf";
   else {
@@ -168,7 +243,11 @@ function formatFloat(v: number, c: string, p: number, flags: string): string {
       return `${m}e${n < 0 ? "-" : "+"}${String(Math.abs(n)).padStart(2, "0")}`;
     };
     const lc = c.toLowerCase();
-    if (lc === "f") s = a.toFixed(p);
+    // toFixed 는 10^21 부터 지수로 쓴다. 그만큼 큰 double 은 정수라 BigInt 로 그대로 쓴다
+    if (lc === "f")
+      s =
+        a < 1e21 ? a.toFixed(p) : `${BigInt(a)}${p ? `.${"0".repeat(p)}` : ""}`;
+    else if (lc === "a") s = hexFloatText(a, p);
     else if (lc === "e") s = exp(a, p);
     else {
       const P = p === 0 ? 1 : p;
@@ -1606,6 +1685,37 @@ export function run(
           );
         return { t: a.t.to, addr: num(a.v) + iv * a.t.to.size, lv: true };
       }
+      case "alignof_expression": {
+        const tn = n.childForFieldName("type");
+        const t = tn ? descriptorOrExpr(tn) : typeOnly(field(n, "value"));
+        return { t: T.ulong, v: (t.k === "array" ? elemOf(t) : t).align };
+      }
+      case "offsetof_expression": {
+        const t = typeOfDescriptor(field(n, "type"));
+        const m = field(n, "member").text;
+        const f =
+          (t.k === "struct" && t.fields?.find((x) => x.name === m)) ||
+          fail(n, `${typeName(t)}에 ${m} 필드가 없습니다`);
+        return { t: T.ulong, v: f.offset };
+      }
+      case "generic_expression": {
+        // _Generic(x, int: …, char *: …, default: …): x 의 타입(배열·함수는 포인터로)과 같은 타입의 식 하나만 계산한다
+        const [ctrl, ...rest] = stmts(n);
+        let t = typeOnly(ctrl);
+        if (t.k === "array") t = ptr(t.of);
+        else if (t.k === "func") t = ptr(t);
+        let fallback: Node | null = null;
+        for (let i = 0; i + 1 < rest.length; i += 2) {
+          const td = rest[i];
+          if (td.text === "default") fallback = rest[i + 1];
+          else if (sameType(typeOfDescriptor(td), t))
+            return evalExpr(rest[i + 1]);
+        }
+        return evalExpr(
+          fallback ??
+            fail(n, `_Generic 에 ${typeName(t)} 에 맞는 것이 없습니다`),
+        );
+      }
       case "sizeof_expression": {
         const tn = n.childForFieldName("type");
         if (tn) return { t: T.ulong, v: descriptorOrExpr(tn).size };
@@ -1682,8 +1792,38 @@ export function run(
   const typeOfDescriptor = (td: Node): CType =>
     abstract(typeOf(field(td, "type")), td.childForFieldName("declarator"));
 
+  const elemOf = (t: CType): CType => (t.k === "array" ? elemOf(t.of) : t);
+  const sameType = (a: CType, b: CType): boolean => {
+    if (a === b) return true;
+    if (a.k === "int" && b.k === "int")
+      return a.size === b.size && a.signed === b.signed && a.name === b.name;
+    if (a.k === "float" && b.k === "float") return a.size === b.size;
+    if (a.k === "ptr" && b.k === "ptr") return sameType(a.to, b.to);
+    if (a.k === "array" && b.k === "array")
+      return (!a.n || !b.n || a.n === b.n) && sameType(a.of, b.of);
+    if (a.k === "func" && b.k === "func") return sameType(a.ret, b.ret);
+    return a.k === "void" && b.k === "void";
+  };
+  const isStaticAssert = (n: Node) =>
+    /^(_Static_assert|static_assert)$/.test(
+      n.childForFieldName("function")?.text ?? "",
+    );
+  // 컴파일할 때 따지는 조건. 거짓이면 실행하지 않고 멈춘다
+  const staticAssert = (n: Node) => {
+    const [cond, msg] = stmts(field(n, "arguments"));
+    if (!constEval(cond ?? fail(n, "조건이 없습니다")))
+      fail(
+        n,
+        `static_assert 실패${msg ? `: ${String.fromCharCode(...literal(msg).units)}` : ""}`,
+      );
+  };
+
   // --- 함수 부르기 ---
   function call(n: Node): Val {
+    if (isStaticAssert(n)) {
+      staticAssert(n);
+      return { t: T.void, v: 0 };
+    }
     const fnNode = field(n, "function");
     const name = fnNode.text;
     const args = field(n, "arguments")
@@ -1732,6 +1872,9 @@ export function run(
     const lib = libCall(n, name, args);
     if (lib) return lib;
     switch (name) {
+      case "_Static_assert":
+      case "static_assert":
+        return { t: T.void, v: 0 };
       case "__va_start": {
         const va = frame().va;
         if (va === undefined)
@@ -1958,7 +2101,7 @@ export function run(
     if (f2) return { t: T.double, v: f2(an(0), an(1)) };
     switch (name) {
       case "fma":
-        return { t: T.double, v: an(0) * an(1) + an(2) };
+        return { t: T.double, v: fma(an(0), an(1), an(2)) };
       case "isnan":
         return { t: T.int, v: Number.isNaN(an(0)) ? 1 : 0 };
       case "isinf":
@@ -2155,7 +2298,7 @@ export function run(
     let i = 0;
     const next = () => args[i++] ?? fail(n, "printf 에 넘긴 값이 모자랍니다");
     return fmt.replace(
-      /%([-0 +#]*)(\*|\d*)(?:\.(\*|\d*))?(hh|h|ll|l|z|j|t|L)?([diouxXcspfFeEgG%])/g,
+      /%([-0 +#]*)(\*|\d*)(?:\.(\*|\d*))?(hh|h|ll|l|z|j|t|L)?([diouxXcspfFeEgGaA%])/g,
       (
         _,
         flags: string,
@@ -2232,7 +2375,12 @@ export function run(
             numeric = false;
             break;
           default:
-            s = formatFloat(num(a.v), c, p ?? 6, flags);
+            s = formatFloat(
+              num(a.v),
+              c,
+              p ?? (c === "a" || c === "A" ? -1 : 6),
+              flags,
+            );
         }
         if (flags.includes("-")) return s.padEnd(w);
         // 정수는 정밀도를 주면 0 채우기를 하지 않는다(실수는 한다)
@@ -2836,9 +2984,15 @@ export function run(
         }
         return;
       }
-      case "expression_statement":
+      case "expression_statement": {
         if (top.text.trim() === ";") return;
+        const e = top.namedChildren[0];
+        if (e?.type === "call_expression" && isStaticAssert(e)) {
+          staticAssert(e);
+          return;
+        }
         return fail(top, "함수 밖에 문장을 쓸 수 없습니다");
+      }
       default:
         return fail(top, `지원하지 않는 맨 위 선언 ${top.type}`);
     }
