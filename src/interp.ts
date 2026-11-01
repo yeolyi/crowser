@@ -5,7 +5,7 @@
 // 진짜 C 라면 조용히 망가질 일(배열 밖 인덱스, NULL 따라가기, free 한 메모리 쓰기, 두 번 free)은 그 줄에서 멈추고 알린다.
 import type { Parser } from "web-tree-sitter";
 import { preprocess } from "./cpp.ts";
-import { fixPostfix, type Node, plain } from "./tree.ts";
+import { fixPostfix, fixSwitch, type Node, plain } from "./tree.ts";
 
 const MEM_SIZE = 0x1000000;
 const STR_BASE = 0x1000;
@@ -528,7 +528,7 @@ export function syntaxError(parser: Parser, src: string): CError | null {
   if (pre.error) return pre.error;
   const tree = parser.parse(pre.code);
   if (!tree) return null;
-  const e = findError(plain(tree.rootNode));
+  const e = findError(fixSwitch(plain(tree.rootNode)));
   tree.delete();
   return e ? { line: e.row, msg: "문법 오류" } : null;
 }
@@ -543,7 +543,9 @@ export function run(
 ): CResult {
   const pre = preprocess(src);
   const parsed = pre.error ? null : parser.parse(pre.code);
-  const tree = parsed ? { rootNode: fixPostfix(plain(parsed.rootNode)) } : null;
+  const tree = parsed
+    ? { rootNode: fixSwitch(fixPostfix(plain(parsed.rootNode))) }
+    : null;
   parsed?.delete();
   const mem = new DataView(new ArrayBuffer(MEM_SIZE));
   const structs = new Map<string, StructType>();

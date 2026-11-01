@@ -7,6 +7,7 @@ export class Node {
   text: string;
   row: number;
   isMissing: boolean;
+  named = true;
   children: Node[] = [];
   namedChildren: Node[] = [];
   fields = new Map<string, Node[]>();
@@ -18,6 +19,7 @@ export class Node {
     this.text = n.text;
     this.row = n.startPosition.row;
     this.isMissing = n.isMissing;
+    this.named = n.isNamed;
   }
   get firstChild() {
     return this.children[0] ?? null;
@@ -82,4 +84,61 @@ function replace(p: Node, old: Node, nu: Node) {
   p.children = p.children.map(sub);
   p.namedChildren = p.namedChildren.map(sub);
   for (const [k, list] of p.fields) p.fields.set(k, list.map(sub));
+}
+
+// tree-sitter-c 는 본문이 { } 가 아닌 switch(switch (x) case 0: f();)를 읽지 못해 switch (x) 를 ERROR 로 두고
+// 본문을 그 뒤 문장으로 읽는다. 본문은 바로 다음 문장 하나인데 case 는 뒤 문장들을 다 품어 읽으니,
+// 첫 문장만 남기고 나머지는 switch 뒤로 꺼낸 다음 둘을 switch 문 하나로 묶는다
+export function fixSwitch(n: Node): Node {
+  for (const c of n.children) fixSwitch(c);
+  for (let i = 0; i < n.children.length; i++) {
+    const e = n.children[i];
+    const cond = e.children[1];
+    const body = n.children[i + 1];
+    if (
+      e.type !== "ERROR" ||
+      e.children.length !== 2 ||
+      e.children[0].type !== "switch" ||
+      cond.type !== "parenthesized_expression" ||
+      !body ||
+      !n.namedChildren.includes(body)
+    )
+      continue;
+    const rest = body.type === "case_statement" ? trimCase(body) : [];
+    const block = make("compound_statement", body, [body]);
+    const sw = make("switch_statement", e, [e.children[0], cond, block]);
+    sw.fields.set("condition", [cond]);
+    sw.fields.set("body", [block]);
+    sw.namedChildren = [cond, block];
+    n.children.splice(i, 2, sw, ...rest);
+    const j = n.namedChildren.indexOf(e);
+    n.namedChildren.splice(j, 2, sw, ...rest.filter((r) => r.named));
+  }
+  return n;
+}
+
+// case 뒤 문장 중 첫 것만 case 에 남기고 나머지를 돌려준다
+function trimCase(c: Node): Node[] {
+  const colon = c.children.findIndex((k) => k.type === ":");
+  const first = c.children.findIndex(
+    (k, i) => i > colon && k.named && k.type !== "comment",
+  );
+  if (first < 0) return [];
+  const rest = c.children.slice(first + 1);
+  c.children = c.children.slice(0, first + 1);
+  c.namedChildren = c.namedChildren.filter((k) => !rest.includes(k));
+  return rest;
+}
+
+function make(type: string, at: Node, kids: Node[]): Node {
+  const n = Object.create(Node.prototype) as Node;
+  n.type = type;
+  n.text = kids.map((k) => k.text).join(" ");
+  n.row = at.row;
+  n.isMissing = false;
+  n.named = true;
+  n.children = kids;
+  n.namedChildren = kids.filter((k) => k.named);
+  n.fields = new Map();
+  return n;
 }
