@@ -52,9 +52,13 @@ function c17(file: string, src: string): string {
         "-Werror=implicit-int",
         "-Werror=int-conversion",
         "-Werror=incompatible-pointer-types",
-        "-Werror=return-type",
+        // K&R 함수 정의는 C23 에서 없어졌다. 우리도 받지 않는다
+        "-Werror=deprecated-non-prototype",
+        // int main() 은 C17 에서도 맞다(C23 에선 (void) 와 같다)
+        "-Wno-strict-prototypes",
+        // int main() 은 C17 에서도 맞다(C23 에선 (void) 와 같다)
+        "-Wno-strict-prototypes",
         "-fsyntax-only",
-        "-w",
         file,
       ],
       { stdio: "pipe" },
@@ -173,6 +177,7 @@ const SUITES: Suite[] = [
             const invalid = /\/invalid_/.test(`/${name}`);
             // 여러 파일을 링크하는 것은 한 파일만 돌리는 우리 범위 밖
             const linked =
+              (!invalid && !/\bmain\s*\(/.test(src)) ||
               multi.has(name) ||
               /\/(libraries|helper_libs)\//.test(name) ||
               name.includes("_client.c");

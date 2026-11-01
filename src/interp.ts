@@ -1,14 +1,15 @@
 // C 부분집합 해석기. tree-sitter-c 의 구문 트리를 따라가며 실행하고, 문장마다 호출 스택의 변수·힙·출력을 기록한다.
-// 진짜 C 처럼 메모리는 바이트 배열 하나(16MB)다: 전역 0x1000~, 문자열 0x2000~, 힙 0x4000~(위로), 스택은 맨 끝에서 아래로 1MB.
+// 진짜 C 처럼 메모리는 바이트 배열 하나(16MB)다: 문자열 0x1000~, 전역 0x2000~, 힙 0x4000~(위로), 스택은 맨 끝에서 아래로 1MB.
+// 전역이 커서 0x4000 을 넘으면 힙 시작을 그 뒤로 민다(작은 프로그램은 늘 같은 주소).
 // 크기는 64비트 clang 과 같게(char 1, short 2, int 4, long 8, 포인터 8) 맞춰 실제 컴파일러와 출력을 대조할 수 있다.
 // 진짜 C 라면 조용히 망가질 일(배열 밖 인덱스, NULL 따라가기, free 한 메모리 쓰기, 두 번 free)은 그 줄에서 멈추고 알린다.
 import type { Parser } from "web-tree-sitter";
 import { preprocess } from "./cpp.ts";
-import { type Node, plain } from "./tree.ts";
+import { fixPostfix, type Node, plain } from "./tree.ts";
 
 const MEM_SIZE = 0x1000000;
-const GLOBAL_BASE = 0x1000;
-const STR_BASE = 0x2000;
+const STR_BASE = 0x1000;
+const GLOBAL_BASE = 0x2000;
 const HEAP_BASE = 0x4000;
 const STACK_TOP = MEM_SIZE;
 const HEAP_END = STACK_TOP - 0x100000;
@@ -81,7 +82,14 @@ const func = (ret: CType): FuncType => ({
   name: `${typeName(ret)} ()`,
   ret,
 });
-const STD_TYPES: Record<string, IntType> = {
+const ptr = (to: CType): PtrType => ({ k: "ptr", to, size: 8, align: 8 });
+const STD_TYPES: Record<string, CType> = {
+  va_list: ptr(T.char),
+  wchar_t: T.int,
+  char16_t: T.ushort,
+  char32_t: T.uint,
+  intmax_t: T.long,
+  uintmax_t: T.ulong,
   size_t: T.ulong,
   ptrdiff_t: T.long,
   intptr_t: T.long,
@@ -95,7 +103,6 @@ const STD_TYPES: Record<string, IntType> = {
   int64_t: T.long,
   uint64_t: T.ulong,
 };
-const ptr = (to: CType): PtrType => ({ k: "ptr", to, size: 8, align: 8 });
 const arr = (of: CType, n: number): ArrayType => ({
   k: "array",
   of,
@@ -221,6 +228,12 @@ class Exit {
   }
 }
 class Continue {}
+class Goto {
+  label: string;
+  constructor(label: string) {
+    this.label = label;
+  }
+}
 
 // 식의 결과: 값(rvalue) 또는 자리(lvalue, 주소). 배열·struct 자리는 쓸 때 바뀐다
 type Val = { t: CType; v: Num; lv?: false; agg?: boolean };
@@ -233,9 +246,12 @@ type Func = {
   type: FuncType;
   ret: CType;
   params: { name: string; type: CType }[];
+  /** 매개변수 뒤에 ... 가 있다 */
+  variadic: boolean;
   body: Node;
 };
-type Binding = { addr: number; type: CType };
+// decl: 이 이름을 만든 선언. goto 로 같은 선언을 다시 지나면 자리를 새로 잡지 않고 다시 쓴다
+type Binding = { addr: number; type: CType; decl?: Node };
 
 const hex = (v: number) => `0x${v.toString(16)}`;
 
@@ -319,7 +335,7 @@ export function run(
 ): CResult {
   const pre = preprocess(src);
   const parsed = pre.error ? null : parser.parse(pre.code);
-  const tree = parsed ? { rootNode: plain(parsed.rootNode) } : null;
+  const tree = parsed ? { rootNode: fixPostfix(plain(parsed.rootNode)) } : null;
   parsed?.delete();
   const mem = new DataView(new ArrayBuffer(MEM_SIZE));
   const structs = new Map<string, StructType>();
@@ -329,12 +345,21 @@ export function run(
   const byAddr = new Map<number, Func>();
   const globals = new Map<string, Binding>();
   const heap: Block[] = [];
+  // 힙 시작. 맨 위 선언을 다 읽고 전역의 끝을 안 뒤에 정한다
+  let heapBase = HEAP_BASE;
   let heapTop = HEAP_BASE;
   let strTop = STR_BASE;
+  // 맨 위 선언을 다 읽고 main 을 부르기 시작했는지
+  let started = false;
   let globalTop = GLOBAL_BASE;
   let sp = STACK_TOP;
   let ops = 0;
-  const frames: { name: string; scopes: Map<string, Binding>[] }[] = [];
+  // va: 가변 인자 함수면 넘겨받은 가변 인자의 첫 칸 주소
+  const frames: {
+    name: string;
+    scopes: Map<string, Binding>[];
+    va?: number;
+  }[] = [];
   const steps: CStep[] = [];
   let out = "";
   let seed = 1;
@@ -375,7 +400,7 @@ export function run(
     if (addr === 0) fail(n, "NULL 포인터를 따라갔습니다");
     if (addr < 0 || addr + size > MEM_SIZE)
       fail(n, `메모리 밖(${hex(addr)})을 건드렸습니다`);
-    if (addr >= HEAP_BASE && addr < HEAP_END) {
+    if (addr >= heapBase && addr < HEAP_END) {
       const b = blockAt(addr);
       if (!b) fail(n, `할당하지 않은 힙(${hex(addr)})을 건드렸습니다`);
       else if (b.freed) fail(n, `free 한 메모리(${hex(addr)})를 건드렸습니다`);
@@ -568,11 +593,13 @@ export function run(
     st.align = align;
     st.size = Math.ceil((st.union ? size : off) / align) * align;
   };
-  // 선언자를 풀어 이름과 타입을 얻는다(포인터·배열·함수 원형)
+  // 선언자를 풀어 이름과 타입을 얻는다. 바깥 선언자부터 타입을 감싸며 안으로 들어간다:
+  // int *a[3] 은 [3] 이 바깥이라 (int * 의 배열 3), int (*a)[3] 은 * 가 바깥이라 (int[3] 을 가리키는 포인터).
+  // 이름이 함수면 fn 에 그 함수 선언자(매개변수 목록이 있는 곳)를 준다
   const declare = (
     b: CType,
     d: Node,
-  ): { name: string; type: CType; fn?: boolean } => {
+  ): { name: string; type: CType; fn?: Node } => {
     switch (d.type) {
       case "identifier":
       case "field_identifier":
@@ -582,14 +609,10 @@ export function run(
         return declare(ptr(b), field(d, "declarator"));
       case "array_declarator": {
         const sizeNode = d.childForFieldName("size");
-        const inner = field(d, "declarator");
-        // int a[2][3] 은 바깥에서부터: a 는 int[3] 두 개
-        const n = sizeNode ? constEval(sizeNode) : 0;
-        if (inner.type === "array_declarator") {
-          const r = declare(b, inner);
-          return { name: r.name, type: rewrapArray(r.type, n) };
-        }
-        return declare(arr(b, n), inner);
+        return declare(
+          arr(b, sizeNode ? constEval(sizeNode) : 0),
+          field(d, "declarator"),
+        );
       }
       case "init_declarator":
         return declare(b, field(d, "declarator"));
@@ -597,7 +620,7 @@ export function run(
         // int f(int) 는 함수 원형, int (*f)(int) 는 함수를 가리키는 포인터
         const inner = field(d, "declarator");
         if (inner.type === "identifier")
-          return { name: inner.text, type: func(b), fn: true };
+          return { name: inner.text, type: func(b), fn: d };
         return declare(func(b), inner);
       }
       case "parenthesized_declarator":
@@ -606,9 +629,30 @@ export function run(
         return fail(d, `지원하지 않는 선언 ${d.type}`);
     }
   };
-  // a[2][3]: 안쪽 선언자를 먼저 풀면 int[2] 가 나오니, 원소 타입을 int[3] 으로 바꿔 끼운다
-  const rewrapArray = (t: CType, n: number): CType =>
-    t.k === "array" ? arr(rewrapArray(t.of, n), t.n) : arr(t, n);
+  // 이름 없는 선언자(형 변환·sizeof 의 타입): 규칙은 declare 와 같다
+  const abstract = (b: CType, d: Node | null): CType => {
+    if (!d) return b;
+    switch (d.type) {
+      case "abstract_pointer_declarator":
+        return abstract(ptr(b), d.childForFieldName("declarator"));
+      case "abstract_array_declarator": {
+        const s = d.childForFieldName("size");
+        return abstract(
+          arr(b, s ? constEval(s) : 0),
+          d.childForFieldName("declarator"),
+        );
+      }
+      case "abstract_function_declarator":
+        return abstract(func(b), d.childForFieldName("declarator"));
+      case "abstract_parenthesized_declarator":
+        return abstract(
+          b,
+          d.namedChildren.find((c) => c.type.startsWith("abstract_")) ?? null,
+        );
+      default:
+        return b;
+    }
+  };
 
   const constEval = (n: Node): number => num(rvalue(n, evalExpr(n)).v);
 
@@ -643,10 +687,11 @@ export function run(
   const strAddr = (s: string) => {
     const known = strings.get(s);
     if (known !== undefined) return known;
-    const a = strTop;
+    // 문자열은 실행 전에 다 모아 둔다(collectStrings). 그 뒤에 처음 보는 것(__func__ 등)은 전역 자리에
+    const a = started ? staticAlloc(null, arr(T.char, s.length + 1)) : strTop;
     for (let i = 0; i < s.length; i++) mem.setUint8(a + i, s.charCodeAt(i));
     mem.setUint8(a + s.length, 0);
-    strTop += s.length + 1;
+    if (!started) strTop += s.length + 1;
     strings.set(s, a);
     return a;
   };
@@ -832,7 +877,7 @@ export function run(
     if (
       place.t.k === "ptr" &&
       place.t.to.k !== "void" &&
-      num(val.v) >= HEAP_BASE
+      num(val.v) >= heapBase
     ) {
       const b = heap.find((h) => h.addr === val.v);
       if (b && !b.ctype) b.ctype = place.t.to;
@@ -1112,19 +1157,8 @@ export function run(
     return globals.has(name);
   };
 
-  const typeOfDescriptor = (td: Node): CType => {
-    let t = typeOf(field(td, "type"));
-    let d = td.childForFieldName("declarator");
-    while (d) {
-      if (d.type === "abstract_pointer_declarator") t = ptr(t);
-      else if (d.type === "abstract_array_declarator") {
-        const s = d.childForFieldName("size");
-        t = arr(t, s ? constEval(s) : 0);
-      }
-      d = d.childForFieldName("declarator");
-    }
-    return t;
-  };
+  const typeOfDescriptor = (td: Node): CType =>
+    abstract(typeOf(field(td, "type")), td.childForFieldName("declarator"));
 
   // --- 함수 부르기 ---
   function call(n: Node): Val {
@@ -1151,11 +1185,31 @@ export function run(
             ? "NULL 함수 포인터를 불렀습니다"
             : `함수가 아닌 ${name}을 불렀습니다`,
         );
-      if (f.params.length !== args.length)
-        fail(n, `${f.name}에 인자를 ${f.params.length}개 넘겨야 합니다`);
+      if (
+        f.variadic
+          ? args.length < f.params.length
+          : f.params.length !== args.length
+      )
+        fail(
+          n,
+          `${f.name}에 인자를 ${f.params.length}개${f.variadic ? " 이상" : ""} 넘겨야 합니다`,
+        );
       return invoke(f, args, n);
     }
     switch (name) {
+      case "__va_start": {
+        const va = frame().va;
+        if (va === undefined)
+          return fail(n, "va_start 는 가변 인자 함수 안에서만 씁니다");
+        return { t: ptr(T.char), v: va };
+      }
+      case "__va_next": {
+        // 지금 칸을 돌려주고 다음 칸으로(칸은 8바이트 단위)
+        const at = argN(0);
+        const cur = num(load(n, at, ptr(T.char)));
+        store(n, at, ptr(T.char), cur + Math.ceil(argN(1) / 8) * 8);
+        return { t: ptr(T.void), v: cur };
+      }
       case "malloc":
       case "calloc": {
         const size = name === "calloc" ? argN(0) * argN(1) : argN(0);
@@ -1426,7 +1480,22 @@ export function run(
 
   function invoke(f: Func, args: Val[], at: Node): Val {
     const savedSp = sp;
-    const fr = { name: f.name, scopes: [new Map<string, Binding>()] };
+    // 가변 인자: 기본 승격(float 는 double, 작은 정수는 int)을 한 값을 8바이트 칸에 차례로 놓는다
+    let va: number | undefined;
+    if (f.variadic) {
+      const extra = args.slice(f.params.length);
+      const slots = extra.map((a) => Math.ceil(Math.max(a.t.size, 8) / 8) * 8);
+      va = alloca(at, arr(T.long, slots.reduce((x, y) => x + y, 0) / 8 || 1));
+      let off = va;
+      extra.forEach((a, i) => {
+        if (a.t.k === "struct") copy(at, off, num(a.v), a.t.size);
+        else if (a.t.k === "float") store(at, off, T.double, num(a.v));
+        else if (a.t.k === "int") store(at, off, T.long, a.v);
+        else store(at, off, ptr(T.void), num(a.v));
+        off += slots[i];
+      });
+    }
+    const fr = { name: f.name, scopes: [new Map<string, Binding>()], va };
     frames.push(fr);
     f.params.forEach((p, i) => {
       const addr = alloca(at, p.type);
@@ -1440,6 +1509,8 @@ export function run(
       if (!(e instanceof Return)) {
         frames.pop();
         sp = savedSp;
+        if (e instanceof Goto)
+          fail(at, `함수 ${f.name} 안에 레이블 ${e.label} 이 없습니다`);
         throw e;
       }
       ret = e.v;
@@ -1537,35 +1608,40 @@ export function run(
   };
 
   // --- 문장 ---
-  const loopBody = (body: Node) => {
-    try {
-      exec(body);
-    } catch (e) {
-      if (e instanceof Break) return "break";
-      if (e instanceof Continue) return "continue";
-      throw e;
-    }
-    return null;
-  };
 
-  const isStatic = (n: Node) =>
+  const storage = (n: Node, word: string) =>
     n.namedChildren.some(
-      (c) => c.type === "storage_class_specifier" && c.text === "static",
+      (c) => c.type === "storage_class_specifier" && c.text === word,
     );
-  const staticAlloc = (n: Node, type: CType) => {
+  const isStatic = (n: Node) => storage(n, "static");
+  const staticAlloc = (n: Node | null, type: CType) => {
     globalTop = Math.ceil(globalTop / type.align) * type.align;
     const addr = globalTop;
     globalTop += type.size;
-    if (globalTop > STR_BASE) fail(n, "전역 변수가 너무 큽니다");
+    if (globalTop > (started ? heapBase : HEAP_END - 0x100000))
+      fail(n, "전역 변수가 너무 큽니다");
     return addr;
   };
-  function declareLocal(n: Node) {
+  // withInit=false: goto 가 건너뛴 선언. 이름과 자리는 생기고 값은 초기화하지 않는다(static 은 원래 시작 전에 초기화된다)
+  function declareLocal(n: Node, withInit = true) {
     const typeNode = field(n, "type");
     const b = typeOf(typeNode);
     for (const d of n.childrenForFieldName("declarator")) {
       if (!d) continue;
       let { name, type, fn } = declare(b, d);
-      if (fn) continue;
+      const scope = frame().scopes[frame().scopes.length - 1];
+      // 블록 안의 함수 원형과 extern 선언은 바깥(전역)의 것을 이 블록에서 다시 보이게 한다
+      if (fn) {
+        const f = funcs.get(name);
+        if (f) scope.set(name, { addr: f.addr, type: f.type });
+        continue;
+      }
+      if (storage(n, "extern")) {
+        const g =
+          globals.get(name) ?? fail(d, `extern ${name} 의 정의가 없습니다`);
+        scope.set(name, g);
+        continue;
+      }
       const init =
         d.type === "init_declarator" ? d.childForFieldName("value") : null;
       if (type.k === "array" && !type.n && init) {
@@ -1575,7 +1651,6 @@ export function run(
             : init.namedChildren.length;
         type = arr(type.of, n0);
       }
-      const scope = frame().scopes[frame().scopes.length - 1];
       // static 지역 변수는 전역 자리에 한 번만 잡고 처음 한 번만 초기화한다
       if (isStatic(n)) {
         if (d.memo === undefined) {
@@ -1585,32 +1660,161 @@ export function run(
         scope.set(name, { addr: d.memo, type });
         continue;
       }
-      const addr = alloca(n, type);
-      scope.set(name, { addr, type });
+      const again = scope.get(name);
+      const addr =
+        again?.decl === d && again.type.size === type.size
+          ? again.addr
+          : alloca(n, type);
+      scope.set(name, { addr, type, decl: d });
       for (let i = 0; i < type.size; i++) mem.setUint8(addr + i, 0xcd); // 초기화하지 않은 값
-      if (init) initialize(d, addr, type, init);
+      if (init && withInit) initialize(d, addr, type, init);
+    }
+  }
+
+  // --- goto ---
+  // goto 는 Goto 를 던지고, 그 레이블을 안에 품은 가장 가까운 블록이 받아 레이블이 있는 문장부터 다시 실행한다.
+  // 레이블이 안쪽 블록·if·반복 안에 있으면 그 안으로 들어가며(resume) 이어 간다
+  const labelMemo = new WeakMap<Node, Set<string>>();
+  const labelsOf = (n: Node): Set<string> => {
+    let set = labelMemo.get(n);
+    if (set) return set;
+    set = new Set();
+    if (n.type === "labeled_statement") set.add(field(n, "label").text);
+    for (const c of n.namedChildren) for (const l of labelsOf(c)) set.add(l);
+    labelMemo.set(n, set);
+    return set;
+  };
+  const labeled = (n: Node) =>
+    n.namedChildren.at(-1) ?? fail(n, "레이블 뒤에 문장이 없습니다");
+  const stmts = (n: Node) =>
+    n.namedChildren.filter((c) => c.type !== "comment");
+
+  function runBlock(n: Node, start: string | null) {
+    frame().scopes.push(new Map());
+    try {
+      const kids = stmts(n);
+      let target = start;
+      let i = 0;
+      for (;;) {
+        try {
+          if (target !== null) {
+            const label = target;
+            const at = kids.findIndex((k) => labelsOf(k).has(label));
+            // 건너뛴 선언도 그 블록 안에선 이름이 있다
+            for (const k of kids.slice(0, at))
+              if (k.type === "declaration") declareLocal(k, false);
+            target = null;
+            i = at + 1;
+            resume(kids[at], label);
+          }
+          for (; i < kids.length; i++) exec(kids[i]);
+          return;
+        } catch (e) {
+          if (!(e instanceof Goto) || !labelsOf(n).has(e.label)) throw e;
+          target = e.label;
+        }
+      }
+    } finally {
+      frame().scopes.pop();
+    }
+  }
+  // 레이블이 n 안에 있을 때, 그 레이블부터 n 을 마저 실행한다
+  function resume(n: Node, label: string) {
+    switch (n.type) {
+      case "labeled_statement":
+        if (field(n, "label").text === label) exec(labeled(n));
+        else resume(labeled(n), label);
+        return;
+      case "compound_statement":
+        runBlock(n, label);
+        return;
+      case "if_statement": {
+        const c = field(n, "consequence");
+        if (labelsOf(c).has(label)) return resume(c, label);
+        const alt = n.childForFieldName("alternative");
+        if (alt)
+          resume(
+            alt.type === "else_clause" ? (alt.namedChildren[0] ?? alt) : alt,
+            label,
+          );
+        return;
+      }
+      case "while_statement":
+      case "do_statement":
+        loop(n, label);
+        return;
+      case "for_statement":
+        forLoop(n, label);
+        return;
+      default:
+        fail(n, "이 문장 안의 레이블로는 goto 로 갈 수 없습니다");
+    }
+  }
+  // 반복의 몸통 한 번. into 가 있으면 몸통의 그 레이블부터
+  const body = (b: Node, into: string | null) => {
+    try {
+      if (into === null) exec(b);
+      else resume(b, into);
+    } catch (e) {
+      if (e instanceof Break) return "break";
+      if (e instanceof Continue) return "continue";
+      throw e;
+    }
+    return null;
+  };
+  function loop(n: Node, into: string | null) {
+    const cond = () => {
+      record(n);
+      return rvalue(n, evalExpr(field(n, "condition"))).v;
+    };
+    let first = into;
+    // while 은 조건부터, do 는 몸통부터. 몸통 안으로 들어왔으면 몸통을 마저 하고 조건으로
+    if (n.type === "while_statement" && first === null && !cond()) return;
+    for (;;) {
+      if (body(field(n, "body"), first) === "break") return;
+      first = null;
+      if (!cond()) return;
+    }
+  }
+  function forLoop(n: Node, into: string | null) {
+    frame().scopes.push(new Map());
+    try {
+      const init = n.childForFieldName("initializer");
+      if (init) {
+        record(n);
+        if (init.type === "declaration") declareLocal(init, into === null);
+        else if (into === null) evalExpr(init);
+      }
+      const cond = n.childForFieldName("condition");
+      const upd = n.childForFieldName("update");
+      let first = into;
+      for (;;) {
+        if (first === null) {
+          record(n);
+          if (cond && !rvalue(n, evalExpr(cond)).v) break;
+        }
+        if (body(field(n, "body"), first) === "break") break;
+        first = null;
+        if (upd) evalExpr(upd);
+      }
+    } finally {
+      frame().scopes.pop();
     }
   }
 
   function exec(n: Node): void {
     tick(n);
     switch (n.type) {
-      case "compound_statement": {
-        frame().scopes.push(new Map());
-        try {
-          for (const s of n.namedChildren)
-            if (s && s.type !== "comment") exec(s);
-        } finally {
-          frame().scopes.pop();
-        }
+      case "compound_statement":
+        runBlock(n, null);
         return;
-      }
       case "declaration":
         record(n);
         declareLocal(n);
         return;
       case "type_definition":
       case "struct_specifier":
+      case "union_specifier":
       case "enum_specifier":
         topLevel(n);
         return;
@@ -1637,41 +1841,12 @@ export function run(
         return;
       }
       case "while_statement":
-        for (;;) {
-          record(n);
-          if (!rvalue(n, evalExpr(field(n, "condition"))).v) break;
-          if (loopBody(field(n, "body")) === "break") break;
-        }
-        return;
       case "do_statement":
-        for (;;) {
-          if (loopBody(field(n, "body")) === "break") break;
-          record(n);
-          if (!rvalue(n, evalExpr(field(n, "condition"))).v) break;
-        }
+        loop(n, null);
         return;
-      case "for_statement": {
-        frame().scopes.push(new Map());
-        try {
-          const init = n.childForFieldName("initializer");
-          if (init) {
-            record(n);
-            if (init.type === "declaration") declareLocal(init);
-            else evalExpr(init);
-          }
-          for (;;) {
-            record(n);
-            const cond = n.childForFieldName("condition");
-            if (cond && !rvalue(n, evalExpr(cond)).v) break;
-            if (loopBody(field(n, "body")) === "break") break;
-            const upd = n.childForFieldName("update");
-            if (upd) evalExpr(upd);
-          }
-        } finally {
-          frame().scopes.pop();
-        }
+      case "for_statement":
+        forLoop(n, null);
         return;
-      }
       case "switch_statement": {
         record(n);
         const v = rvalue(n, evalExpr(field(n, "condition"))).v;
@@ -1704,9 +1879,11 @@ export function run(
       case ";":
         return;
       case "labeled_statement":
-      case "goto_statement":
-        fail(n, "goto 는 지원하지 않습니다");
+        exec(labeled(n));
         return;
+      case "goto_statement":
+        record(n);
+        throw new Goto(field(n, "label").text);
       default:
         fail(n, `지원하지 않는 문장 ${n.type}`);
     }
@@ -1732,18 +1909,19 @@ export function run(
         return;
       }
       case "function_definition": {
-        let ret = typeOf(field(top, "type"));
-        let d = field(top, "declarator");
-        while (d.type === "pointer_declarator") {
-          ret = ptr(ret);
-          d = field(d, "declarator");
-        }
-        const name = field(d, "declarator").text;
+        const decl = declare(
+          typeOf(field(top, "type")),
+          field(top, "declarator"),
+        );
+        if (!decl.fn || decl.type.k !== "func")
+          return fail(top, "함수 정의의 선언을 읽지 못했습니다");
+        const { name } = decl;
+        const ret = decl.type.ret;
         const params: { name: string; type: CType }[] = [];
-        for (const p of field(d, "parameters").namedChildren) {
+        let variadic = false;
+        for (const p of field(decl.fn, "parameters").namedChildren) {
           if (!p || p.type !== "parameter_declaration") {
-            if (p?.type === "variadic_parameter")
-              fail(p, "가변 인자 함수는 지원하지 않습니다");
+            if (p?.type === "variadic_parameter") variadic = true;
             continue;
           }
           const pt = field(p, "type");
@@ -1752,10 +1930,16 @@ export function run(
             if (pt.text === "void") continue;
             fail(p, "매개변수 이름이 없습니다");
           }
-          const decl = declare(typeOf(pt), pd as Node);
+          const pdecl = declare(typeOf(pt), pd as Node);
+          // 배열·함수 매개변수는 포인터다
           params.push({
-            name: decl.name,
-            type: decl.type.k === "array" ? ptr(decl.type.of) : decl.type,
+            name: pdecl.name,
+            type:
+              pdecl.type.k === "array"
+                ? ptr(pdecl.type.of)
+                : pdecl.type.k === "func"
+                  ? ptr(pdecl.type)
+                  : pdecl.type,
           });
         }
         const known = funcs.get(name);
@@ -1765,6 +1949,7 @@ export function run(
           type: func(ret),
           ret,
           params,
+          variadic,
           body: field(top, "body"),
         };
         funcs.set(name, f);
@@ -1787,8 +1972,14 @@ export function run(
                 ? unquote(init.text.slice(1, -1)).length + 1
                 : init.namedChildren.length,
             );
-          const addr = staticAlloc(d, type);
-          globals.set(name, { addr, type });
+          // 같은 전역을 여러 번 선언할 수 있다(extern int a; int a = 1;). 크기가 정해지는 선언에서 자리를 잡는다
+          const known = globals.get(name);
+          const addr =
+            known && known.type.size >= type.size
+              ? known.addr
+              : staticAlloc(d, type);
+          if (!known || known.type.size < type.size)
+            globals.set(name, { addr, type });
           if (init) initialize(d, addr, type, init);
         }
         return;
@@ -1801,10 +1992,26 @@ export function run(
     }
   }
 
+  // 문자열 상수를 실행 전에 모아 앞쪽(0x1000~)에 둔다. 전역은 그 뒤 0x2000 부터
+  const collectStrings = (n: Node) => {
+    if (n.type === "string_literal" || n.type === "concatenated_string")
+      evalExpr(n);
+    else for (const c of n.namedChildren) collectStrings(c);
+  };
+
   let error: CError | null = null;
   let exit = 0;
   try {
+    collectStrings(tree.rootNode);
+    globalTop = Math.max(GLOBAL_BASE, Math.ceil(strTop / 0x1000) * 0x1000);
     for (const top of tree.rootNode.namedChildren) if (top) topLevel(top);
+    // 실행 중에 생기는 static 지역 변수 자리를 조금 남기고 힙을 시작한다
+    heapBase = Math.max(
+      HEAP_BASE,
+      Math.ceil((globalTop + 0x1000) / 0x1000) * 0x1000,
+    );
+    heapTop = heapBase;
+    started = true;
     const main = funcs.get("main") ?? fail(null, "main 함수가 없습니다");
     // int main(int argc, char **argv) 면 프로그램 이름 하나만 넘긴다
     const argv = staticAlloc(tree.rootNode, arr(ptr(T.char), 2));

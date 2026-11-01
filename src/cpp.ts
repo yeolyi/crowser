@@ -33,6 +33,9 @@ class CppFail extends Error {
 
 const BUILTIN: Record<string, string> = {
   NULL: "((void *)0)",
+  __STDC__: "1",
+  __STDC_VERSION__: "201710L",
+  __STDC_HOSTED__: "1",
   true: "1",
   false: "0",
   bool: "_Bool",
@@ -97,6 +100,18 @@ const BUILTIN: Record<string, string> = {
   NAN: "(0.0f / 0.0f)",
 };
 
+// stdarg.h. 가변 인자는 부른 쪽 스택에 8바이트 칸으로 차례로 놓인다(__va_start 가 첫 칸 주소).
+// va_arg 는 진짜 헤더처럼 매크로로: 타입 자리를 파서가 식으로 읽지 못해 형 변환과 sizeof 로 바꾼다
+const FUNCTION_MACROS: Record<string, Macro> = {
+  va_start: { params: ["ap", "last"], body: "((ap) = __va_start())" },
+  va_arg: {
+    params: ["ap", "T"],
+    body: "(*(T *)__va_next(&(ap), sizeof(T)))",
+  },
+  va_end: { params: ["ap"], body: "((void)(ap))" },
+  va_copy: { params: ["d", "s"], body: "((d) = (s))" },
+};
+
 // 주석을 공백으로 바꾼다(줄바꿈은 남긴다). 문자열 속 /* 는 건드리지 않는다
 function stripComments(src: string) {
   let out = "";
@@ -137,9 +152,13 @@ export function preprocess(src: string): {
   code: string;
   error: CppError | null;
 } {
-  const macros = new Map<string, Macro>(
-    Object.entries(BUILTIN).map(([k, body]) => [k, { params: null, body }]),
-  );
+  const macros = new Map<string, Macro>([
+    ...Object.entries(BUILTIN).map(([k, body]): [string, Macro] => [
+      k,
+      { params: null, body },
+    ]),
+    ...Object.entries(FUNCTION_MACROS),
+  ]);
   // 줄 끝 \ 로 이은 줄을 합치고, 합친 만큼 뒤에 빈 줄을 둔다
   const raw = stripComments(src).split("\n");
   const lines: string[] = [];
@@ -184,14 +203,20 @@ export function preprocess(src: string): {
       let j = i;
       while (j < text.length && isId(text[j])) j++;
       const name = text.slice(i, j);
+      if (name === "__LINE__" || name === "__FILE__") {
+        out += name === "__LINE__" ? String(line + 1) : '"main.c"';
+        i = j;
+        continue;
+      }
       const m = macros.get(name);
       if (!m || hide.has(name)) {
         out += name;
         i = j;
         continue;
       }
+      // 펼친 결과는 앞뒤와 띄운다. 붙이면 0x1E 와 +1 이 0x1E+1 처럼 한 토큰으로 읽힌다
       if (m.params === null) {
-        out += expand(m.body, line, new Set([...hide, name]));
+        out += ` ${expand(m.body, line, new Set([...hide, name]))} `;
         i = j;
         continue;
       }
@@ -243,11 +268,11 @@ export function preprocess(src: string): {
         m.params.slice(0, fixed).map((p, x) => [p, args[x]]),
       );
       if (variadic) bind.set("__VA_ARGS__", args.slice(fixed).join(", "));
-      out += expand(
+      out += ` ${expand(
         substitute(m.body, bind, (a) => expand(a, line, hide)),
         line,
         new Set([...hide, name]),
-      );
+      )} `;
       i = k + 1;
     }
     return out;

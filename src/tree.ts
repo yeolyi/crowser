@@ -55,3 +55,31 @@ export function plain(root: TSNode): Node {
     }
   return top;
 }
+
+// tree-sitter-c 는 -x-- 처럼 단항 연산자(- ! ~ +) 뒤의 후위 ++·-- 를 (-x)-- 로 읽는다.
+// 후위 연산자가 먼저 붙으니 -(x--) 로 고쳐 둔다
+export function fixPostfix(n: Node): Node {
+  for (const c of n.children) {
+    const f = fixPostfix(c);
+    if (f !== c) replace(n, c, f);
+  }
+  const arg = n.childForFieldName("argument");
+  if (
+    n.type !== "update_expression" ||
+    n.children[0] !== arg ||
+    arg.type !== "unary_expression"
+  )
+    return n;
+  const x = arg.childForFieldName("argument");
+  if (!x) return n;
+  replace(n, arg, x);
+  replace(arg, x, fixPostfix(n));
+  return arg;
+}
+
+function replace(p: Node, old: Node, nu: Node) {
+  const sub = (c: Node) => (c === old ? nu : c);
+  p.children = p.children.map(sub);
+  p.namedChildren = p.namedChildren.map(sub);
+  for (const [k, list] of p.fields) p.fields.set(k, list.map(sub));
+}
