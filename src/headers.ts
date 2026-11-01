@@ -1,5 +1,12 @@
 // 표준 헤더가 주는 이름. 헤더를 include 해야 그 이름(함수·타입·매크로)이 보인다.
 // 여러 헤더가 같이 주는 이름(NULL, size_t)은 그중 하나만 include 해도 된다
+// math.h 의 실수 함수. 이름 끝에 f 를 붙이면 float, l 을 붙이면 long double(= double) 판
+export const MATH =
+  "sqrt fabs floor ceil round trunc sin cos tan asin acos atan sinh cosh tanh exp exp2 log log10 log2 cbrt pow fmod atan2 hypot fmin fmax fdim copysign fma ldexp".split(
+    " ",
+  );
+export const MATH_FL = MATH.flatMap((f) => [`${f}f`, `${f}l`]);
+
 export const HEADER_NAMES: Record<string, string> = {
   "stdio.h":
     "printf fprintf sprintf snprintf puts putchar fputs fputc putc fflush getchar " +
@@ -17,7 +24,8 @@ export const HEADER_NAMES: Record<string, string> = {
   "math.h":
     "sqrt cbrt pow exp exp2 log log10 log2 sin cos tan asin acos atan atan2 sinh cosh tanh " +
     "fabs floor ceil round trunc fmod hypot fmin fmax fdim fma ldexp copysign " +
-    "isnan isinf isfinite signbit INFINITY HUGE_VAL NAN",
+    "isnan isinf isfinite signbit INFINITY HUGE_VAL NAN " +
+    MATH_FL.join(" "),
   "time.h": "clock time clock_t time_t size_t NULL CLOCKS_PER_SEC",
   "assert.h": "assert static_assert",
   "stdarg.h": "va_list va_start va_arg va_end va_copy",

@@ -141,10 +141,12 @@ Reference: **clang `-std=c17 -pedantic-errors`, 64-bit**. Programs clang rejects
 | [c-testsuite](https://github.com/c-testsuite/c-testsuite)                              | **207 / 207**   |
 | [Writing a C Compiler](https://github.com/nlsandler/writing-a-c-compiler-tests) (valid) | **718 / 718**   |
 | Writing a C Compiler (invalid programs rejected)                                       | **692 / 692**   |
+| [Csmith](https://github.com/csmith-project/csmith) random programs, checksum vs. clang | **365 / 365**   |
 
 ```sh
 pnpm test          # examples vs. clang output, and error-line tests
 pnpm test:suites   # the suites above (downloaded on first run; needs clang)
+pnpm fuzz 1 100    # Csmith seeds 1..100 vs. clang (brew install csmith)
 ```
 
 ## Performance

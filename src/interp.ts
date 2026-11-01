@@ -4,7 +4,7 @@
 // 크기는 64비트 clang 과 같게(char 1, short 2, int 4, long 8, 포인터 8) 맞춰 실제 컴파일러와 출력을 대조할 수 있다.
 // 진짜 C 라면 조용히 망가질 일(배열 밖 인덱스, NULL 따라가기, free 한 메모리 쓰기, 두 번 free)은 그 줄에서 멈추고 알린다.
 import { preprocess } from "./cpp.ts";
-import { needs, visible } from "./headers.ts";
+import { MATH, MATH_FL, needs, visible } from "./headers.ts";
 import { type Node, ParseError, parse } from "./parse.ts";
 
 const MEM_SIZE = 0x1000000;
@@ -71,13 +71,7 @@ type FuncType = {
   q?: number;
 };
 export type CType =
-  | IntType
-  | FloatType
-  | PtrType
-  | ArrayType
-  | StructType
-  | VoidType
-  | FuncType;
+  IntType | FloatType | PtrType | ArrayType | StructType | VoidType | FuncType;
 
 const int = (name: string, size: number, signed: boolean): IntType => ({
   k: "int",
@@ -329,7 +323,8 @@ const LIBRARY = Object.fromEntries(
     "snprintf sprintf srand strcat strchr strcmp strcpy strlen strncat strncmp strncpy strrchr strstr strtod strtol " +
     "strtoll strtoul strtoull time tolower toupper sqrt fabs floor ceil round trunc sin cos tan asin acos atan sinh " +
     "cosh tanh exp exp2 log log10 log2 cbrt pow fmod atan2 hypot fmin fmax fdim ldexp copysign " +
-    "fopen fclose fread fwrite fgetc getc fgets feof ferror rewind fseek ftell remove ungetc"
+    "fopen fclose fread fwrite fgetc getc fgets feof ferror rewind fseek ftell remove ungetc " +
+    MATH_FL.join(" ")
   )
     .split(" ")
     .map((name, i) => [0xc00 + i * 4, name]),
@@ -373,9 +368,11 @@ const BUILTIN_RET: Record<string, CType> = {
   atof: T.double,
   strtod: T.double,
   ...Object.fromEntries(
-    `sqrt fabs floor ceil round trunc sin cos tan asin acos atan sinh cosh tanh exp exp2 log log10 log2 cbrt pow fmod atan2 hypot fmin fmax fdim copysign fma ldexp`
-      .split(" ")
-      .map((f) => [f, T.double]),
+    MATH.flatMap((f) => [
+      [f, T.double],
+      [`${f}l`, T.double],
+      [`${f}f`, T.float],
+    ]),
   ),
   fopen: ptr(FILE),
   fgets: ptr(T.char),
@@ -1968,7 +1965,7 @@ function execute(
           // &a[n] 은 끝 바로 다음 주소라 써도 된다(따라가지만 않으면).
           // &p->m 도 따라가지 않고 주소만 더하니 p 가 NULL 이어도 된다(&((T *)0)->m 으로 offsetof 를 셈한다)
           pastEnd = argNode;
-          for (let a: Node | undefined = argNode; a; ) {
+          for (let a: Node | undefined = argNode; a;) {
             addressOnly.add(a);
             a =
               a.type === "field_expression" || a.type === "subscript_expression"
@@ -3550,8 +3547,19 @@ function execute(
     ldexp: (x, y) => x * 2 ** y,
     copysign: (x, y) => Math.abs(x) * (y < 0 || Object.is(y, -0) ? -1 : 1),
   };
-  const libCall = (n: Node, name: string, args: Val[]): Val | null => {
-    const a = (i: number) => args[i] ?? fail(n, `${name}에 인자가 모자랍니다`);
+  const libCall = (n: Node, name0: string, args: Val[]): Val | null => {
+    const a = (i: number) => args[i] ?? fail(n, `${name0}에 인자가 모자랍니다`);
+    // sqrtf·sqrtl 은 sqrt 로 셈하고, f 판은 인자와 결과를 float 로 자른다
+    const fl = MATH_FL.includes(name0) ? name0.at(-1) : undefined;
+    const name = fl ? name0.slice(0, -1) : name0;
+    if (fl === "f") {
+      const r = libCall(
+        n,
+        name,
+        args.map((x) => ({ t: T.double, v: Math.fround(num(x.v)) })),
+      );
+      return r && { t: T.float, v: Math.fround(num(r.v)) };
+    }
     const an = (i: number) => num(a(i).v);
     const f1 = MATH1[name];
     if (f1) return { t: T.double, v: f1(an(0)) };
@@ -4059,7 +4067,10 @@ function execute(
   };
   // 값 글은 그 자리의 바이트가 그대로면 지난번 것을 다시 쓴다(단계마다 모든 변수·블록을 다시 읽지 않게).
   // show 가 읽는 바이트: 배열은 앞 20개(char 배열은 전부), 나머지는 크기만큼
-  const shown = new Map<number, { name: string; bytes: Uint8Array; value: string }>();
+  const shown = new Map<
+    number,
+    { name: string; bytes: Uint8Array; value: string }
+  >();
   const span = (t: CType) =>
     t.k === "array" && !(t.of.k === "int" && t.of.name === T.char.name)
       ? Math.min(t.size, 20 * t.of.size)
@@ -4123,10 +4134,7 @@ function execute(
     a.vars.length === b.vars.length &&
     a.vars.every((v, i) => sameVar(v, b.vars[i]));
   const sameBlock = (a: CBlock, b: CBlock | undefined) =>
-    !!b &&
-    a.freed === b.freed &&
-    a.type === b.type &&
-    a.value === b.value;
+    !!b && a.freed === b.freed && a.type === b.type && a.value === b.value;
   // 지난 단계의 모습. 바뀐 것만 담으려고 견준다
   let last: Omit<CStep, "line" | "out"> = { frames: [], globals: [], heap: [] };
   let outSent = 0;
@@ -4352,6 +4360,10 @@ function execute(
         const t = typeOnly(n);
         return (t.k === "array" || t.k === "func") && staticObject(n);
       }
+      // 다차원 배열의 한 줄(g[1])이나 배열 멤버(s.a)는 그 첫 칸의 주소로 바뀐다
+      case "subscript_expression":
+      case "field_expression":
+        return typeOnly(n).k === "array" && staticObject(n);
       case "pointer_expression":
         return (
           field(n, "operator").text === "&" &&

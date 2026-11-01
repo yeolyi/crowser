@@ -141,10 +141,12 @@ type CVar = { name: string; type: string; addr: number; size: number; value: str
 | [c-testsuite](https://github.com/c-testsuite/c-testsuite)                              | **207 / 207**   |
 | [Writing a C Compiler](https://github.com/nlsandler/writing-a-c-compiler-tests) (올바른 프로그램) | **718 / 718**   |
 | Writing a C Compiler (잘못된 프로그램 거부)                                            | **692 / 692**   |
+| [Csmith](https://github.com/csmith-project/csmith) 무작위 프로그램, clang과 체크섬 대조 | **365 / 365**   |
 
 ```sh
 pnpm test          # 예제를 clang 출력과 대조, 오류 줄 시험
 pnpm test:suites   # 위 시험 모음(처음 돌릴 때 받는다. clang 필요)
+pnpm fuzz 1 100    # Csmith 씨앗 1~100 을 clang과 대조(brew install csmith)
 ```
 
 ## 속도

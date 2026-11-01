@@ -42,6 +42,7 @@
     "typecheck": "tsc",
     "test": "node test/run.ts",
     "test:suites": "node test/run.ts --suite",
+    "fuzz": "node test/fuzz.ts",
     "prepublishOnly": "npm run typecheck && npm run build"
   },
   "devDependencies": {
