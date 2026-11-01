@@ -312,7 +312,8 @@ type Func = {
   body: Node;
 };
 // decl: 이 이름을 만든 선언문. goto 로 그 앞으로 돌아가면 이름을 지운다
-type Binding = { addr: number; type: CType; decl?: Node };
+// missing: extern 으로 선언만 하고 정의는 없는 전역. sizeof 는 되고 값을 쓰면 오류(진짜 C 의 링크 오류)
+type Binding = { addr: number; type: CType; decl?: Node; missing?: true };
 
 const hex = (v: number) => `0x${v.toString(16)}`;
 
@@ -408,8 +409,8 @@ export function run(
   const byAddr = new Map<number, Func>();
   const globals = new Map<string, Binding>();
   const heap: Block[] = [];
-  // 힙 시작. 맨 위 선언을 다 읽고 전역의 끝을 안 뒤에 정한다
-  let heapBase = HEAP_BASE;
+  // 힙은 전역을 다 잡은 뒤 그 위에서 시작한다. 그 전엔 힙이 없다
+  let heapBase = HEAP_END;
   let heapTop = HEAP_BASE;
   let strTop = STR_BASE;
   // 맨 위 선언을 다 읽고 main 을 부르기 시작했는지
@@ -754,14 +755,20 @@ export function run(
 
   // --- 변수 ---
   const frame = () => frames[frames.length - 1];
+  const missingCheck = (n: Node, name: string, b: Binding) =>
+    b.missing && !dry ? fail(n, `extern ${name} 의 정의가 없습니다`) : b;
   const lookup = (n: Node, name: string): Binding => {
     const f = frame();
     if (f)
       for (let i = f.scopes.length - 1; i >= 0; i--) {
         const v = f.scopes[i].get(name);
-        if (v) return v;
+        if (v) return missingCheck(n, name, v);
       }
-    return globals.get(name) ?? fail(n, `선언하지 않은 이름 ${name}`);
+    return missingCheck(
+      n,
+      name,
+      globals.get(name) ?? fail(n, `선언하지 않은 이름 ${name}`),
+    );
   };
   // 16바이트 이상인 배열은 16바이트 경계에 둔다(64비트 ABI 와 같게)
   const alignOf = (t: CType) =>
@@ -2455,6 +2462,10 @@ export function run(
           if (type.k === "array" && !type.n && init)
             type = arr(type.of, initCount(init));
           // 같은 전역을 여러 번 선언할 수 있다(extern int a; int a = 1;). 크기가 정해지는 선언에서 자리를 잡는다
+          if (!defined.has(name)) {
+            globals.set(name, { addr: 0, type, missing: true });
+            continue;
+          }
           const known = globals.get(name);
           const addr =
             known && known.type.size >= type.size
@@ -2481,16 +2492,58 @@ export function run(
     else for (const c of n.namedChildren) collectStrings(c);
   };
 
+  const declaredName = (d: Node): string => {
+    const inner = d.childForFieldName("declarator");
+    if (inner) return declaredName(inner);
+    const named = d.namedChildren.find((c) => c.type !== "comment");
+    return d.type === "identifier" || !named ? d.text : declaredName(named);
+  };
+  // 정의가 있는 전역 이름: extern 이 아니거나 초기화가 있는 선언
+  const defined = new Set<string>();
+  for (const top of tree?.rootNode.namedChildren ?? [])
+    if (top.type === "declaration")
+      for (const d of top.childrenForFieldName("declarator"))
+        if (d && (!storage(top, "extern") || d.type === "init_declarator"))
+          defined.add(declaredName(d));
+
+  // 함수 안 static 변수들의 크기 합. 타입을 셀 수 없는 것(그 블록에서 만든 struct 등)은 0 으로 친다
+  const staticLocals = (n: Node): number => {
+    if (n.type === "declaration" && isStatic(n)) {
+      const t = field(n, "type");
+      if (
+        /^(struct|union|enum)_specifier$/.test(t.type) &&
+        t.childForFieldName("body")
+      )
+        return 0;
+      try {
+        const b = typeOf(t);
+        return n
+          .childrenForFieldName("declarator")
+          .reduce((sum, d) => sum + (d ? declare(b, d).type.size + 16 : 0), 0);
+      } catch {
+        return 0;
+      }
+    }
+    return n.namedChildren.reduce((sum, c) => sum + staticLocals(c), 0);
+  };
+
   let error: CError | null = null;
   let exit = 0;
   try {
     collectStrings(tree.rootNode);
     globalTop = Math.max(GLOBAL_BASE, Math.ceil(strTop / 0x1000) * 0x1000);
     for (const top of tree.rootNode.namedChildren) if (top) topLevel(top);
-    // 실행 중에 생기는 static 지역 변수 자리를 조금 남기고 힙을 시작한다
+    // 실행 중에 생기는 static 지역 변수 자리를 남기고 힙을 시작한다
     heapBase = Math.max(
       HEAP_BASE,
-      Math.ceil((globalTop + 0x1000) / 0x1000) * 0x1000,
+      Math.ceil(
+        (globalTop +
+          tree.rootNode.namedChildren
+            .filter((f) => f.type === "function_definition")
+            .reduce((sum, f) => sum + staticLocals(field(f, "body")), 0) +
+          0x1000) /
+          0x1000,
+      ) * 0x1000,
     );
     heapTop = heapBase;
     started = true;

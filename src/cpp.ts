@@ -151,6 +151,49 @@ function skipQuoted(s: string, i: number) {
 const isIdStart = (c: string) => /[A-Za-z_]/.test(c);
 const isId = (c: string) => /[A-Za-z0-9_]/.test(c);
 
+// 타입 지정자는 표준에선 아무 순서로 써도 되지만(int long unsigned) tree-sitter-c 는 정해진 순서만 읽는다.
+// 이어진 지정자 묶음을 저장 부류·한정자 → signed/unsigned → short/long → char/int/double 순으로 다시 놓는다
+const SPEC_RANK = new Map(
+  [
+    "typedef extern static auto register inline _Noreturn _Thread_local const volatile restrict",
+    "signed unsigned",
+    "short long",
+    "char int float double _Bool _Complex",
+  ].flatMap((ws, rank) => ws.split(" ").map((w) => [w, rank] as const)),
+);
+const orderSpecifiers = (code: string) =>
+  code.replace(
+    /"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|\b[A-Za-z_]\w*(?:[ \t]+[A-Za-z_]\w*)+\b/g,
+    (m) => {
+      if (m[0] === '"' || m[0] === "'") return m;
+      const words = m.split(/([ \t]+)/);
+      // 지정자만 이어진 가장 긴 구간마다 정렬한다
+      const ws = words.filter((_, i) => i % 2 === 0);
+      const out: string[] = [];
+      for (let i = 0; i < ws.length; ) {
+        if (!SPEC_RANK.has(ws[i])) {
+          out.push(ws[i++]);
+          continue;
+        }
+        let j = i;
+        while (j < ws.length && SPEC_RANK.has(ws[j])) j++;
+        out.push(
+          ...ws
+            .slice(i, j)
+            .map((w, k) => [w, k] as const)
+            .sort(
+              (a, b) =>
+                (SPEC_RANK.get(a[0]) ?? 0) - (SPEC_RANK.get(b[0]) ?? 0) ||
+                a[1] - b[1],
+            )
+            .map(([w]) => w),
+        );
+        i = j;
+      }
+      return words.map((w, i) => (i % 2 ? w : out[i / 2])).join("");
+    },
+  );
+
 export function preprocess(src: string): {
   code: string;
   error: CppError | null;
@@ -410,7 +453,7 @@ export function preprocess(src: string): {
       return { code: "", error: { line: e.line, msg: e.message } };
     throw e;
   }
-  return { code: out.join("\n"), error: null };
+  return { code: orderSpecifiers(out.join("\n")), error: null };
 }
 
 function fail(line: number, msg: string): never {
