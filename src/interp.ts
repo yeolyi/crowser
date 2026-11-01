@@ -743,7 +743,44 @@ export function run(
   }
 
   // --- 타입 읽기 ---
+  // T (*fp)(int) = f; 처럼 typedef 이름 뒤에 ( 가 오는 선언을 tree-sitter 는 T 를 부르는 식으로 읽는다
+  // (typedef 이름을 모른다). T 자리를 int 로 바꿔 다시 읽고, 그 타입 자리만 T 로 둔 선언으로 바꾼다
+  const typeOverride = new WeakMap<Node, CType>();
+  const reparsed = new WeakMap<Node, Node | null>();
+  const typedefName = (name: string): CType | undefined => {
+    const local = findScoped(name);
+    if (local) return local.kind === "typedef" ? local.type : undefined;
+    return globals.has(name) || funcs.has(name)
+      ? undefined
+      : typedefs.get(name);
+  };
+  const typedefDecl = (n: Node): Node | null => {
+    const m = /^(\s*)([A-Za-z_]\w*)(\s*\()/.exec(n.text);
+    const t = m && typedefName(m[2]);
+    if (!m || !t) return null;
+    let d = reparsed.get(n);
+    if (d === undefined) {
+      const text = `${m[1]}int ${n.text.slice(m[1].length + m[2].length)}`;
+      const tree = parser.parse(text);
+      const root = tree ? plain(tree.rootNode) : null;
+      tree?.delete();
+      const decl = root?.namedChildren[0];
+      d = decl?.type === "declaration" && !findError(decl) ? decl : null;
+      if (d) {
+        const shift = (x: Node) => {
+          x.row += n.row;
+          for (const c of x.children) shift(c);
+        };
+        shift(d);
+      }
+      reparsed.set(n, d);
+    }
+    if (d) typeOverride.set(field(d, "type"), t);
+    return d;
+  };
   const typeOf = (node: Node): CType => {
+    const forced = typeOverride.get(node);
+    if (forced) return forced;
     switch (node.type) {
       case "primitive_type":
       case "sized_type_specifier": {
@@ -876,15 +913,10 @@ export function run(
       // 이름 없는 struct·union 멤버: 그 필드들이 바깥 struct 의 필드가 된다
       if (!decls.length && b.k === "struct") {
         const off = st.union ? 0 : Math.ceil(bit / 8 / b.align) * b.align;
-        let first = true;
-        for (const f of b.fields ?? []) {
-          fields.push({
-            ...f,
-            offset: off + f.offset,
-            skip: f.skip || (b.union && !first),
-          });
-          if (!f.skip) first = false;
-        }
+        // { } 초기화에선 이름 없는 멤버 전체가 한 자리다. 이름 "" 로 두고 그 안의 필드는 이름으로만 찾는다
+        fields.push({ name: "", type: b, offset: off });
+        for (const f of b.fields ?? [])
+          if (f.name) fields.push({ ...f, offset: off + f.offset, skip: true });
         if (st.union) size = Math.max(size, b.size);
         else bit = (off + b.size) * 8;
         align = Math.max(align, b.align);
@@ -1053,27 +1085,20 @@ export function run(
   };
 
   // --- 값 ---
+  // 자리에서 읽은 값의 타입. 비트 필드는 int 로 읽는다(폭이 int 보다 넓으면 선언한 타입)
+  const valueType = (t: CType): CType => {
+    if (t.k !== "int" || t.bits === undefined) return t;
+    const { bits, signed, size } = t;
+    if (bits < 32 || (bits === 32 && signed)) return T.int;
+    if (bits === 32) return T.uint;
+    return size === 8 ? (signed ? T.long : T.ulong) : T.int;
+  };
   const rvalue = (n: Node, x: X): Val => {
     if (!x.lv) return x;
     if (x.t.k === "array") return { t: ptr(x.t.of), v: x.addr };
     if (x.t.k === "struct") return { t: x.t, v: x.addr, agg: true };
     if (x.t.k === "func") return { t: x.t, v: x.addr };
-    // 비트 필드의 값은 int 로 읽는다(폭이 int 보다 넓으면 선언한 타입)
-    if (x.t.k === "int" && x.t.bits !== undefined) {
-      const { bits, signed, size } = x.t;
-      const t =
-        bits < 32 || (bits === 32 && signed)
-          ? T.int
-          : bits === 32
-            ? T.uint
-            : size === 8
-              ? signed
-                ? T.long
-                : T.ulong
-              : T.int;
-      return { t, v: load(n, x.addr, x.t) };
-    }
-    return { t: x.t, v: load(n, x.addr, x.t) };
+    return { t: valueType(x.t), v: load(n, x.addr, x.t) };
   };
 
   // 문자열 상수의 글자 값들(끝의 0 은 빼고). 이어 붙인 것 중 하나라도 넓은 문자열이면 모두 그 타입
@@ -1291,8 +1316,9 @@ export function run(
   // 실수가 끼면 실수로: 하나라도 double 이면 double, 아니면 float
   const floatArith = (n: Node, op: string, a: Val, b: Val): Val => {
     const t = a.t === T.double || b.t === T.double ? T.double : T.float;
-    const x = num(a.v);
-    const y = num(b.v);
+    // 두 값을 먼저 t 로 바꾼다(16777217L 과 float 를 견주면 정수도 float 로 반올림된다)
+    const x = num(wrap(t, a.v));
+    const y = num(wrap(t, b.v));
     const cmp: Record<string, boolean> = {
       "<": x < y,
       ">": x > y,
@@ -1478,6 +1504,8 @@ export function run(
 
   // & 바로 안의 a[i] (그 식을 계산하는 동안만 뜻이 있다)
   let pastEnd: Node | null = null;
+  // & 안에서 주소만 셈하는 식들(p->a.b 의 p->a 까지)
+  const addressOnly = new WeakSet<Node>();
   // 지금 실행 중인 곳(해석기 자체가 멈출 때 그 줄을 알리려고)
   let here: Node | null = null;
   const tick = (n: Node) => {
@@ -1578,7 +1606,7 @@ export function run(
         let val = rvalue(n, evalExpr(field(n, "right")));
         if (op !== "=") val = arith(n, op.slice(0, -1), rvalue(n, place), val);
         assign(n, place, val);
-        return { t: place.t, v: wrap(place.t, val.v) };
+        return { t: valueType(place.t), v: wrap(place.t, val.v) };
       }
       case "binary_expression": {
         const op = field(n, "operator").text;
@@ -1624,8 +1652,18 @@ export function run(
             const p = rvalue(n, evalExpr(field(argNode, "argument")));
             if (p.t.k === "ptr") return p;
           }
-          // &a[n] 은 끝 바로 다음 주소라 써도 된다(따라가지만 않으면)
+          // &a[n] 은 끝 바로 다음 주소라 써도 된다(따라가지만 않으면).
+          // &p->m 도 따라가지 않고 주소만 더하니 p 가 NULL 이어도 된다(&((T *)0)->m 으로 offsetof 를 셈한다)
           pastEnd = argNode;
+          for (let a: Node | undefined = argNode; a; ) {
+            addressOnly.add(a);
+            a =
+              a.type === "field_expression" || a.type === "subscript_expression"
+                ? (a.childForFieldName("argument") ?? undefined)
+                : a.type === "parenthesized_expression"
+                  ? a.namedChildren[0]
+                  : undefined;
+          }
           const x = evalExpr(argNode);
           if (x.t.k === "func")
             return { t: ptr(x.t), v: x.lv ? x.addr : num(x.v) };
@@ -1644,7 +1682,7 @@ export function run(
         const nv = arith(n, op === "++" ? "+" : "-", old, { t: T.int, v: 1 });
         assign(n, place, nv);
         const prefix = n.firstChild?.type === op;
-        return prefix ? { t: old.t, v: wrap(old.t, nv.v) } : old;
+        return prefix ? { t: old.t, v: wrap(place.t, nv.v) } : old;
       }
       case "field_expression": {
         const op = field(n, "operator").text;
@@ -1658,7 +1696,8 @@ export function run(
             return fail(n, "-> 앞은 struct 포인터여야 합니다");
           st = p.t.to;
           addr = num(p.v);
-          if (addr === 0 && !dry) fail(n, "NULL 포인터를 따라갔습니다");
+          if (addr === 0 && !dry && !addressOnly.has(n))
+            fail(n, "NULL 포인터를 따라갔습니다");
         } else {
           if (b.t.k !== "struct") return fail(n, ". 앞은 struct 여야 합니다");
           st = b.t;
@@ -1688,6 +1727,8 @@ export function run(
           !dry &&
           base0.lv &&
           base0.t.k === "array" &&
+          // 크기 없는 마지막 멤버(int data[])는 malloc 으로 받은 만큼 쓴다. 그 범위는 힙이 잡는다
+          base0.t.n > 0 &&
           (iv < 0 || iv >= base0.t.n + end)
         )
           fail(
@@ -1767,7 +1808,17 @@ export function run(
         let t = typeOfDescriptor(field(n, "type"));
         const init = field(n, "value");
         if (t.k === "array" && !t.n) t = arr(t.of, initCount(init, t.of));
-        const addr = frames.length ? alloca(n, t) : staticAlloc(n, t);
+        if (dry) return { t, addr: 0, lv: true };
+        // 같은 식을 다시 지나면(반복·goto) 같은 자리를 다시 쓴다. 표준에서도 같은 객체다
+        const f = frames.length ? frame() : null;
+        const slot = f?.slots.get(n);
+        const addr =
+          slot && slot.size === t.size
+            ? slot.addr
+            : f
+              ? alloca(n, t)
+              : staticAlloc(n, t);
+        f?.slots.set(n, { addr, size: t.size });
         initialize(n, addr, t, init);
         return { t, addr, lv: true };
       }
@@ -2492,7 +2543,12 @@ export function run(
       if (t.k === "struct")
         return depth > 2
           ? "{…}"
-          : `{${(t.fields ?? []).map((f) => `${f.name}: ${show(f.type, addr + f.offset, depth + 1)}`).join(", ")}}`;
+          : `{${(t.fields ?? [])
+              .filter((f) => f.name)
+              .map(
+                (f) => `${f.name}: ${show(f.type, addr + f.offset, depth + 1)}`,
+              )
+              .join(", ")}}`;
       if (t.k === "ptr") {
         const v = Number(mem.getBigUint64(addr, true));
         return v === 0 ? "NULL" : hex(v);
@@ -2828,10 +2884,13 @@ export function run(
       case "enum_specifier":
         topLevel(n);
         return;
-      case "expression_statement":
+      case "expression_statement": {
         record(n);
-        if (n.namedChildren[0]) evalExpr(n.namedChildren[0]);
+        const d = typedefDecl(n);
+        if (d) declareLocal(d);
+        else if (n.namedChildren[0]) evalExpr(n.namedChildren[0]);
         return;
+      }
       case "return_statement": {
         record(n);
         const e = n.namedChildren[0];
@@ -3004,6 +3063,11 @@ export function run(
       case "expression_statement": {
         if (top.text.trim() === ";") return;
         const e = top.namedChildren[0];
+        const d = typedefDecl(top);
+        if (d) {
+          markDefined(d);
+          return topLevel(d);
+        }
         if (e?.type === "call_expression" && isStaticAssert(e)) {
           staticAssert(e);
           return;
@@ -3030,11 +3094,13 @@ export function run(
   };
   // 정의가 있는 전역 이름: extern 이 아니거나 초기화가 있는 선언
   const defined = new Set<string>();
+  const markDefined = (top: Node) => {
+    for (const d of top.childrenForFieldName("declarator"))
+      if (d && (!storage(top, "extern") || d.type === "init_declarator"))
+        defined.add(declaredName(d));
+  };
   for (const top of tree?.rootNode.namedChildren ?? [])
-    if (top.type === "declaration")
-      for (const d of top.childrenForFieldName("declarator"))
-        if (d && (!storage(top, "extern") || d.type === "init_declarator"))
-          defined.add(declaredName(d));
+    if (top.type === "declaration") markDefined(top);
 
   // 함수 안 static 변수들의 크기 합. 타입을 셀 수 없는 것(그 블록에서 만든 struct 등)은 0 으로 친다
   const staticLocals = (n: Node): number => {

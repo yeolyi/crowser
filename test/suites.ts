@@ -97,6 +97,30 @@ function outside(src: string): string | undefined {
     if (!HEADERS.includes(m[1])) return `헤더 ${m[1]}`;
 }
 
+// 진짜 clang 으로 돌려도 0 으로 끝나지 않는 것: 구현이 정하는 동작을 gcc 대로 가정한 시험(int 보다 넓은 비트 필드의
+// 계산 폭 등). 우리 기준은 clang 이라 센다면 틀린 쪽을 맞다고 해야 한다
+const runFile = path.join(cache, "clang-run.json");
+const runMemo: Record<string, string> = fs.existsSync(runFile)
+  ? JSON.parse(fs.readFileSync(runFile, "utf8"))
+  : {};
+function clangFails(file: string, src: string): string | undefined {
+  const key = createHash("sha1").update(src).digest("hex");
+  if (runMemo[key] === undefined) {
+    const bin = path.join(cache, "clang-run");
+    try {
+      execFileSync("clang", ["-std=c17", "-w", "-o", bin, file], {
+        stdio: "pipe",
+      });
+      execFileSync(bin, [], { stdio: "pipe", timeout: 10_000 });
+      runMemo[key] = "";
+    } catch {
+      runMemo[key] = "clang 으로 돌려도 실패(gcc 고유 동작)";
+    }
+    fs.writeFileSync(runFile, JSON.stringify(runMemo));
+  }
+  return runMemo[key] || undefined;
+}
+
 function standard(file: string, src: string): string | undefined {
   const o = outside(src);
   if (o) return o;
@@ -237,7 +261,7 @@ const SUITES: Suite[] = [
             want: { exit: 0 },
             skip: /\{\s*dg-/.test(src)
               ? "dg 지시(특정 환경용)"
-              : standard(tmp, src),
+              : (standard(tmp, src) ?? clangFails(tmp, src)),
           };
         });
     },
@@ -283,7 +307,8 @@ export function runSuites(parser: Parser, names: string[]) {
       let why: string;
       let errored = false;
       try {
-        const r = run(parser, c.src, { limit: 0, ops: 5_000_000 });
+        // 연산 한도는 실제로 쓸 때와 같게(넘으면 '너무 오래 걸려' 로 센다)
+        const r = run(parser, c.src, { limit: 0 });
         errored = !!r.error;
         why = r.error
           ? r.error.msg

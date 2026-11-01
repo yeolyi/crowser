@@ -364,7 +364,7 @@ export function preprocess(src: string): {
   ) => {
     const toks =
       body.match(
-        /##|#|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z_]\w*|\s+|./g,
+        /##|#|(?:u8|[LuU])?"(?:\\.|[^"\\])*"|(?:u8|[LuU])?'(?:\\.|[^'\\])*'|[A-Za-z_]\w*|\s+|./g,
       ) ?? [];
     const res: string[] = [];
     for (let t = 0; t < toks.length; t++) {
@@ -405,8 +405,8 @@ export function preprocess(src: string): {
       (_, a, b) => (macros.has(a ?? b) ? " 1 " : " 0 "),
     );
     const e = expand(d, line).replace(
-      /'(?:\\.|[^'\\])+'|\b\d\w*|\b[A-Za-z_]\w*\b/g,
-      (t) => (/^['\d]/.test(t) ? t : "0"),
+      /\b(?:u8|[LuU])?'(?:\\.|[^'\\])+'|'(?:\\.|[^'\\])+'|\b\d\w*|\b[A-Za-z_]\w*\b/g,
+      (t) => (/^(?:u8|[LuU])?'|^\d/.test(t) ? t : "0"),
     );
     return evalIf(e, line) !== 0;
   };
@@ -511,7 +511,7 @@ type IfVal = { v: bigint; u: boolean };
 function evalIf(src: string, line: number): number {
   const toks =
     src.match(
-      /0[xX][0-9a-fA-F]+[uUlL]*|0[bB][01]+[uUlL]*|\d+[uUlL]*|'(?:\\.|[^'\\])+'|&&|\|\||==|!=|<=|>=|<<|>>|[-+*/%<>!~&|^()?:]|\S/g,
+      /0[xX][0-9a-fA-F]+[uUlL]*|0[bB][01]+[uUlL]*|\d+[uUlL]*|(?:u8|[LuU])?'(?:\\.|[^'\\])+'|&&|\|\||==|!=|<=|>=|<<|>>|[-+*/%<>!~&|^()?:]|\S/g,
     ) ?? [];
   let p = 0;
   const peek = () => toks[p];
@@ -615,8 +615,12 @@ function evalIf(src: string, line: number): number {
       const x = unary(live);
       return fix({ v: ~x.v, u: x.u });
     }
-    if (t?.[0] === "'")
-      return { v: BigInt(charValue(t.slice(1, -1))), u: false };
+    const q = t?.indexOf("'") ?? -1;
+    if (t && q >= 0) {
+      // L·u·U 문자는 부호 없이 그 값 그대로, 그냥 문자는 char(부호 있음)
+      const wide = q > 0 && t.slice(0, q) !== "u8";
+      return { v: BigInt(charValue(t.slice(q + 1, -1), wide)), u: false };
+    }
     const m = t && /^(0[xX][0-9a-fA-F]+|0[bB][01]+|\d+)([uUlL]*)$/.exec(t);
     if (!m) return fail(line, "#if 식을 읽지 못했습니다");
     const digits = m[1];
@@ -646,11 +650,11 @@ const CHAR_ESC: Record<string, number> = {
   "?": 63,
 };
 // '\n'·'\x41'·'\101' 같은 문자 상수의 값(char 는 부호가 있다)
-function charValue(body: string): number {
+function charValue(body: string, wide = false): number {
   let c: number;
-  if (body[0] !== "\\") c = body.charCodeAt(0);
+  if (body[0] !== "\\") c = body.codePointAt(0) ?? 0;
   else if (body[1] === "x") c = Number.parseInt(body.slice(2), 16);
   else if (/[0-7]/.test(body[1])) c = Number.parseInt(body.slice(1, 4), 8);
   else c = CHAR_ESC[body[1]] ?? body.charCodeAt(1);
-  return (c << 24) >> 24;
+  return wide ? c : (c << 24) >> 24;
 }
