@@ -4,6 +4,7 @@
 // 크기는 64비트 clang 과 같게(char 1, short 2, int 4, long 8, 포인터 8) 맞춰 실제 컴파일러와 출력을 대조할 수 있다.
 // 진짜 C 라면 조용히 망가질 일(배열 밖 인덱스, NULL 따라가기, free 한 메모리 쓰기, 두 번 free)은 그 줄에서 멈추고 알린다.
 import { preprocess } from "./cpp.ts";
+import { needs, visible } from "./headers.ts";
 import { type Node, ParseError, parse } from "./parse.ts";
 
 const MEM_SIZE = 0x1000000;
@@ -617,11 +618,14 @@ function execute(
   let syntaxErr: CError | null = null;
   if (!pre.error)
     try {
-      root = parse(pre.code);
+      root = parse(pre.code, pre.headers);
     } catch (e) {
       if (!(e instanceof ParseError)) throw e;
       syntaxErr = { line: e.line, msg: e.message };
     }
+  // 표준 이름은 그 헤더를 include 했거나 직접 선언했을 때만 보인다
+  const known = (name: string) =>
+    visible(name, pre.headers) || protos.has(name);
   const mem = new DataView(new ArrayBuffer(MEM_SIZE));
   const structs = new Map<string, StructType>();
   const typedefs = new Map<string, CType>();
@@ -1276,7 +1280,7 @@ function execute(
     return missingCheck(
       n,
       name,
-      globals.get(name) ?? fail(n, `선언하지 않은 이름 ${name}`),
+      globals.get(name) ?? fail(n, `선언하지 않은 이름 ${name}${needs(name)}`),
     );
   };
   // 16바이트 이상인 배열은 16바이트 경계에 둔다(64비트 ABI 와 같게)
@@ -1845,12 +1849,12 @@ function execute(
         const fn = funcs.get(name);
         if (fn && !lookupMaybe(name)) return { t: fn.type, v: fn.addr };
         const proto = protos.get(name);
-        const libAddr = LIBRARY_ADDR.get(name);
+        const libAddr = known(name) ? LIBRARY_ADDR.get(name) : undefined;
         if (libAddr !== undefined && !lookupMaybe(name))
           return { t: proto ?? libType(name), v: libAddr };
         // 원형만 있고 정의는 아직(검사 중) 또는 끝내 없다
         if (proto && !lookupMaybe(name)) return { t: proto, v: 0 };
-        const stream = STREAMS[name];
+        const stream = known(name) ? STREAMS[name] : undefined;
         if (stream && !lookupMaybe(name)) return { t: ptr(FILE), v: stream };
         if (name === "__func__" && !lookupMaybe(name))
           return evalString(frame()?.name ?? "");
@@ -3157,7 +3161,8 @@ function execute(
     }
   };
   const isStaticAssert = (n: Node) =>
-    /^(_Static_assert|static_assert)$/.test(
+    ((name) =>
+      name === "_Static_assert" || (name === "static_assert" && known(name)))(
       n.childForFieldName("function")?.text ?? "",
     );
   // 컴파일할 때 따지는 조건. 거짓이면 실행하지 않고 멈춘다
@@ -3187,8 +3192,11 @@ function execute(
       !funcs.has(name) &&
       !protos.has(name);
     if (dry) {
-      if (builtin && !(name in BUILTIN_RET) && !LIBRARY_ADDR.has(name))
-        fail(n, `선언하지 않은 함수 ${name}`);
+      if (
+        builtin &&
+        ((!(name in BUILTIN_RET) && !LIBRARY_ADDR.has(name)) || !known(name))
+      )
+        fail(n, `선언하지 않은 함수 ${name}${needs(name)}`);
       const t = builtin ? libType(name) : rvalue(n, evalExpr(fnNode)).t;
       const ft = t.k === "ptr" ? t.to : t;
       if (ft.k !== "func") return fail(n, `함수가 아닌 ${name}을 불렀습니다`);
@@ -5565,12 +5573,12 @@ function execute(
       }
       const fn = funcs.get(id);
       if (fn) return { l: { a: lit(fn.addr), t: fn.type } };
-      const libAddr = LIBRARY_ADDR.get(id);
+      const libAddr = known(id) ? LIBRARY_ADDR.get(id) : undefined;
       if (libAddr !== undefined && !protos.has(id))
         return { l: { a: lit(libAddr), t: libType(id) } };
       if (libAddr !== undefined)
         return { l: { a: lit(libAddr), t: protos.get(id) ?? libType(id) } };
-      const stream = STREAMS[id];
+      const stream = known(id) ? STREAMS[id] : undefined;
       if (stream) return { r: { c: lit(stream), t: ptr(FILE) } };
       return noJit();
     };

@@ -1,25 +1,9 @@
 // 전처리기. 파싱 전에 #define·#if 를 풀어 평범한 C 로 바꾼다.
 // 줄 번호가 원문과 같아야 오류와 지금 줄을 원문 위에 보일 수 있으니, 지시문 줄은 빈 줄로 두고 줄 수를 바꾸지 않는다.
-// #include 는 아는 표준 헤더만 받고 내용은 넣지 않는다(printf·malloc 같은 함수는 해석기가 안다).
+// #include 는 아는 표준 헤더만 받는다. 헤더 파일은 없고 그 헤더의 매크로만 정의한다(함수·타입은 해석기가 안다).
+import { HEADER_NAMES, HEADERS, headersOf } from "./headers.ts";
 
-export const HEADERS = [
-  "stdio.h",
-  "stdlib.h",
-  "string.h",
-  "stdbool.h",
-  "stddef.h",
-  "stdint.h",
-  "limits.h",
-  "assert.h",
-  "ctype.h",
-  "math.h",
-  "float.h",
-  "time.h",
-  "stdarg.h",
-  "iso646.h",
-  "stdalign.h",
-  "stdnoreturn.h",
-];
+export { HEADERS };
 
 type Macro = { params: string[] | null; body: string };
 export type CppError = { line: number; msg: string };
@@ -107,6 +91,9 @@ const BUILTIN: Record<string, string> = {
   DBL_MAX: "1.7976931348623157e+308",
   DBL_MIN: "2.2250738585072014e-308",
   DBL_EPSILON: "2.2204460492503131e-16",
+  alignas: "_Alignas",
+  alignof: "_Alignof",
+  noreturn: "_Noreturn",
   // math.h
   INFINITY: "(1e308f * 10)",
   HUGE_VAL: "(1e308 * 10)",
@@ -164,15 +151,21 @@ const isId = (c: string) => /[A-Za-z0-9_]/.test(c);
 export function preprocess(src: string): {
   code: string;
   error: CppError | null;
+  /** include 한 표준 헤더 */
+  headers: Set<string>;
 } {
   const pushed = new Map<string, (Macro | undefined)[]>();
-  const macros = new Map<string, Macro>([
-    ...Object.entries(BUILTIN).map(([k, body]): [string, Macro] => [
-      k,
-      { params: null, body },
-    ]),
-    ...Object.entries(FUNCTION_MACROS),
-  ]);
+  const headers = new Set<string>();
+  const known = (name: string): Macro | undefined =>
+    name in BUILTIN
+      ? { params: null, body: BUILTIN[name] }
+      : FUNCTION_MACROS[name];
+  // 헤더가 주는 매크로는 include 할 때 정의한다
+  const macros = new Map<string, Macro>(
+    [...Object.keys(BUILTIN), ...Object.keys(FUNCTION_MACROS)]
+      .filter((k) => !headersOf(k))
+      .map((k): [string, Macro] => [k, known(k) as Macro]),
+  );
   // 줄 끝 \ 로 이은 줄을 합치고, 합친 만큼 뒤에 빈 줄을 둔다
   const raw = stripComments(src).split("\n");
   const lines: string[] = [];
@@ -442,6 +435,13 @@ export function preprocess(src: string): {
                 i,
                 `지원하지 않는 헤더 ${rest.trim()}(표준 헤더 ${HEADERS.join(", ")}만 됩니다)`,
               );
+            if (!headers.has(h)) {
+              headers.add(h);
+              for (const name of HEADER_NAMES[h].split(" ")) {
+                const m = known(name);
+                if (m && !macros.has(name)) macros.set(name, m);
+              }
+            }
           } else if (kw === "error") fail(i, `#error ${rest}`);
           else if (kw === "line") {
             // #line 줄 ["파일"]: 다음 줄의 번호가 줄이 된다
@@ -475,10 +475,10 @@ export function preprocess(src: string): {
     if (conds.length) fail(lines.length - 1, "#endif 가 모자랍니다");
   } catch (e) {
     if (e instanceof CppFail)
-      return { code: "", error: { line: e.line, msg: e.message } };
+      return { code: "", error: { line: e.line, msg: e.message }, headers };
     throw e;
   }
-  return { code: out.join("\n"), error: null };
+  return { code: out.join("\n"), error: null, headers };
 }
 
 function fail(line: number, msg: string): never {

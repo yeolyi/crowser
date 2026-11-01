@@ -1,6 +1,7 @@
 // C17 파서. 전처리를 마친 코드를 재귀 하강으로 읽어 문법 나무를 만든다.
 // typedef 이름을 기억하며 읽는다: C 는 T * x; 가 곱셈인지 선언인지를 T 가 타입 이름인지로 가른다.
 // 노드의 종류와 필드 이름은 tree-sitter-c 와 같게 두었다(해석기가 그 이름으로 읽는다).
+import { HEADERS, needs, visible } from "./headers.ts";
 
 export class Node {
   type: string;
@@ -217,12 +218,11 @@ const KEYWORDS = new Set([
   "goto",
   "sizeof",
   "_Alignof",
-  "alignof",
   "_Alignas",
   "_Generic",
   "_Static_assert",
 ]);
-// 헤더가 typedef 로 주는 이름(해석기가 STD_TYPES 로 안다)
+// 헤더가 typedef 로 주는 이름(해석기가 STD_TYPES 로 안다). include 한 헤더의 것만 타입 이름이다
 const STD_TYPEDEFS = [
   "size_t",
   "ssize_t",
@@ -289,7 +289,10 @@ const ASSIGN = new Set([
 
 type Kid = Node | [string, Node] | null | undefined;
 
-export function parse(src: string): Node {
+export function parse(
+  src: string,
+  included: ReadonlySet<string> = new Set(HEADERS),
+): Node {
   const toks = lex(src);
   let p = 0;
   const peek = (o = 0) => toks[Math.min(p + o, toks.length - 1)];
@@ -336,7 +339,9 @@ export function parse(src: string): Node {
 
   // typedef 이름의 범위. 값이 true 면 타입 이름, false 면 같은 이름의 변수가 가린 것
   const scopes: Map<string, boolean>[] = [
-    new Map(STD_TYPEDEFS.map((n) => [n, true])),
+    new Map(
+      STD_TYPEDEFS.filter((n) => visible(n, included)).map((n) => [n, true]),
+    ),
   ];
   const isTypedef = (name: string) => {
     for (let i = scopes.length - 1; i >= 0; i--) {
@@ -685,6 +690,7 @@ export function parse(src: string): Node {
           if (storage)
             fail(`매개변수에는 ${storage.text} 를 붙일 수 없습니다`, toks[s]);
           if (!type) {
+            missingType();
             if (peek().k === "id")
               fail(
                 "옛 K&R 함수 정의(int f(a) int a; { … })는 받지 않습니다. 매개변수마다 타입을 씁시다",
@@ -752,6 +758,18 @@ export function parse(src: string): Node {
       ["type", type as Node],
       d && ["declarator", d],
     ]);
+  };
+
+  // size_t n; 처럼 헤더 없이 쓴 표준 타입 이름은 식으로 읽혀 엉뚱한 오류가 나니 먼저 알린다
+  const missingType = () => {
+    const t = peek();
+    if (
+      t.k === "id" &&
+      STD_TYPEDEFS.includes(t.v) &&
+      !isTypedef(t.v) &&
+      (peek(1).k === "id" || is("*", 1) || is(")", 1) || is(",", 1))
+    )
+      fail(`선언하지 않은 타입 이름 ${t.v}${needs(t.v)}`);
   };
 
   // --- 선언 ---
@@ -1057,6 +1075,7 @@ export function parse(src: string): Node {
           : "if·while·for 의 몸에 선언만 둘 수 없습니다. { } 로 감쌉시다",
       );
     }
+    missingType();
     const e = expr();
     return make("expression_statement", from, [e, expect(";")]);
   };
@@ -1178,7 +1197,7 @@ export function parse(src: string): Node {
     }
     if (
       t.k === "id" &&
-      (t.v === "sizeof" || t.v === "_Alignof" || t.v === "alignof")
+      (t.v === "sizeof" || t.v === "_Alignof")
     ) {
       const kw = leaf(toks[p++]);
       const kind =
@@ -1302,7 +1321,13 @@ export function parse(src: string): Node {
       }
       case "id": {
         if (t.v === "_Generic") return generic();
-        if (t.v === "offsetof" && is("(", 1) && !isTypedef(t.v))
+        // offsetof 는 stddef.h 의 매크로라 그때만 안다
+        if (
+          t.v === "offsetof" &&
+          visible(t.v, included) &&
+          is("(", 1) &&
+          !isTypedef(t.v)
+        )
           return offsetOf();
         if (KEYWORDS.has(t.v)) fail(`식이 와야 하는데 ${shown(t)} 가 왔습니다`);
         p++;
@@ -1361,6 +1386,7 @@ export function parse(src: string): Node {
       continue;
     }
     if (!startsType()) {
+      missingType();
       const t = peek();
       if (t.k === "id" && is("(", 1) && !KEYWORDS.has(t.v))
         fail(
