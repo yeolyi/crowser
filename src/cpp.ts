@@ -37,6 +37,10 @@ const BUILTIN: Record<string, string> = {
   __STDC__: "1",
   __STDC_VERSION__: "201710L",
   __STDC_HOSTED__: "1",
+  // 표준이 고르게 둔 기능 중 없는 것: 복소수, _Atomic, 스레드
+  __STDC_NO_COMPLEX__: "1",
+  __STDC_NO_ATOMICS__: "1",
+  __STDC_NO_THREADS__: "1",
   true: "1",
   false: "0",
   bool: "_Bool",
@@ -255,7 +259,9 @@ export function preprocess(src: string): {
         continue;
       }
       const m = macros.get(name);
-      if (!m || hide.has(name)) {
+      // L'a'·u8"…" 의 접두사는 이름이 아니라 상수의 일부다
+      const prefix = /^(L|u|U|u8)$/.test(name) && /['"]/.test(text[j] ?? "");
+      if (!m || hide.has(name) || prefix) {
         out += name;
         i = j;
         continue;
@@ -372,7 +378,10 @@ export function preprocess(src: string): {
       /\bdefined\s*(?:\(\s*(\w+)\s*\)|(\w+))/g,
       (_, a, b) => (macros.has(a ?? b) ? " 1 " : " 0 "),
     );
-    const e = expand(d, line).replace(/\b[A-Za-z_]\w*\b/g, "0");
+    const e = expand(d, line).replace(
+      /'(?:\\.|[^'\\])+'|\b\d\w*|\b[A-Za-z_]\w*\b/g,
+      (t) => (/^['\d]/.test(t) ? t : "0"),
+    );
     return evalIf(e, line) !== 0;
   };
 
@@ -460,11 +469,13 @@ function fail(line: number, msg: string): never {
   throw new CppFail(line, msg);
 }
 
-// #if 의 정수 식을 계산한다(우선순위 오름차순으로 내려가는 재귀 하강)
+// #if 의 정수 식을 계산한다(우선순위 오름차순으로 내려가는 재귀 하강). 표준대로 intmax_t·uintmax_t(64비트)로
+// 계산하고, 하나라도 unsigned 면 unsigned 로. && || ?: 의 계산하지 않는 쪽에서는 0 으로 나눠도 오류가 아니다
+type IfVal = { v: bigint; u: boolean };
 function evalIf(src: string, line: number): number {
   const toks =
     src.match(
-      /0[xX][0-9a-fA-F]+|\d+|&&|\|\||==|!=|<=|>=|<<|>>|[-+*/%<>!~&|^()?:]|\S/g,
+      /0[xX][0-9a-fA-F]+[uUlL]*|0[bB][01]+[uUlL]*|\d+[uUlL]*|'(?:\\.|[^'\\])+'|&&|\|\||==|!=|<=|>=|<<|>>|[-+*/%<>!~&|^()?:]|\S/g,
     ) ?? [];
   let p = 0;
   const peek = () => toks[p];
@@ -484,85 +495,126 @@ function evalIf(src: string, line: number): number {
     ["+", "-"],
     ["*", "/", "%"],
   ];
-  const ternary = (): number => {
-    const c = binary(0);
+  const fix = (x: IfVal): IfVal => ({
+    v: x.u ? BigInt.asUintN(64, x.v) : BigInt.asIntN(64, x.v),
+    u: x.u,
+  });
+  const bool = (b: boolean): IfVal => ({ v: b ? 1n : 0n, u: false });
+  const ternary = (live: boolean): IfVal => {
+    const c = binary(0, live);
     if (peek() !== "?") return c;
     eat("?");
-    const a = ternary();
+    const a = ternary(live && c.v !== 0n);
     eat(":");
-    const b = ternary();
-    return c ? a : b;
+    const b = ternary(live && c.v === 0n);
+    return fix({ v: c.v ? a.v : b.v, u: a.u || b.u });
   };
-  const binary = (lv: number): number => {
-    if (lv === BIN.length) return unary();
-    let a = binary(lv + 1);
+  const binary = (lv: number, live: boolean): IfVal => {
+    if (lv === BIN.length) return unary(live);
+    let a = binary(lv + 1, live);
     while (BIN[lv].includes(peek())) {
       const op = eat();
-      const b = binary(lv + 1);
-      a = applyOp(op, a, b, line);
+      const rhsLive =
+        live && (op === "&&" ? a.v !== 0n : op === "||" ? a.v === 0n : true);
+      const b = binary(lv + 1, rhsLive);
+      a = apply(op, a, b, rhsLive);
     }
     return a;
   };
-  const unary = (): number => {
+  const apply = (op: string, a: IfVal, b: IfVal, live: boolean): IfVal => {
+    if (op === "&&") return bool(a.v !== 0n && b.v !== 0n);
+    if (op === "||") return bool(a.v !== 0n || b.v !== 0n);
+    // << >> 는 왼쪽 값의 타입, 나머지는 둘 중 하나라도 unsigned 면 unsigned
+    const u = op === "<<" || op === ">>" ? a.u : a.u || b.u;
+    const x = u ? BigInt.asUintN(64, a.v) : a.v;
+    const y = u && op !== "<<" && op !== ">>" ? BigInt.asUintN(64, b.v) : b.v;
+    switch (op) {
+      case "==":
+        return bool(x === y);
+      case "!=":
+        return bool(x !== y);
+      case "<":
+        return bool(x < y);
+      case ">":
+        return bool(x > y);
+      case "<=":
+        return bool(x <= y);
+      case ">=":
+        return bool(x >= y);
+      case "/":
+      case "%":
+        if (y === 0n) {
+          if (live) fail(line, "#if 식에서 0으로 나눴습니다");
+          return { v: 0n, u };
+        }
+        return fix({ v: op === "/" ? x / y : x % y, u });
+    }
+    const r = {
+      "|": x | y,
+      "^": x ^ y,
+      "&": x & y,
+      "<<": x << (y & 63n),
+      ">>": x >> (y & 63n),
+      "+": x + y,
+      "-": x - y,
+      "*": x * y,
+    }[op];
+    if (r === undefined) return fail(line, `#if 식의 연산자 ${op}`);
+    return fix({ v: r, u });
+  };
+  const unary = (live: boolean): IfVal => {
     const t = eat();
     if (t === "(") {
-      const v = ternary();
+      const v = ternary(live);
       eat(")");
       return v;
     }
-    if (t === "-") return -unary();
-    if (t === "+") return unary();
-    if (t === "!") return unary() ? 0 : 1;
-    if (t === "~") return ~unary();
-    const v = Number(t?.replace(/[uUlL]+$/, ""));
-    if (t === undefined || Number.isNaN(v))
-      return fail(line, "#if 식을 읽지 못했습니다");
-    return v;
+    if (t === "-") {
+      const x = unary(live);
+      return fix({ v: -x.v, u: x.u });
+    }
+    if (t === "+") return unary(live);
+    if (t === "!") return bool(unary(live).v === 0n);
+    if (t === "~") {
+      const x = unary(live);
+      return fix({ v: ~x.v, u: x.u });
+    }
+    if (t?.[0] === "'")
+      return { v: BigInt(charValue(t.slice(1, -1))), u: false };
+    const m = t && /^(0[xX][0-9a-fA-F]+|0[bB][01]+|\d+)([uUlL]*)$/.exec(t);
+    if (!m) return fail(line, "#if 식을 읽지 못했습니다");
+    const digits = m[1];
+    const v = /^0\d/.test(digits)
+      ? BigInt(`0o${digits.slice(1)}`)
+      : BigInt(digits);
+    // 접미사 u 가 있거나 intmax_t 에 안 들어가면 unsigned
+    return { v, u: /u/i.test(m[2]) || v > 0x7fffffffffffffffn };
   };
-  const v = ternary();
+  const v = ternary(true);
   if (p < toks.length) fail(line, "#if 식을 읽지 못했습니다");
-  return v;
+  return v.v === 0n ? 0 : 1;
 }
 
-function applyOp(op: string, a: number, b: number, line: number): number {
-  switch (op) {
-    case "||":
-      return a || b ? 1 : 0;
-    case "&&":
-      return a && b ? 1 : 0;
-    case "|":
-      return a | b;
-    case "^":
-      return a ^ b;
-    case "&":
-      return a & b;
-    case "==":
-      return a === b ? 1 : 0;
-    case "!=":
-      return a !== b ? 1 : 0;
-    case "<":
-      return a < b ? 1 : 0;
-    case ">":
-      return a > b ? 1 : 0;
-    case "<=":
-      return a <= b ? 1 : 0;
-    case ">=":
-      return a >= b ? 1 : 0;
-    case "<<":
-      return a << b;
-    case ">>":
-      return a >> b;
-    case "+":
-      return a + b;
-    case "-":
-      return a - b;
-    case "*":
-      return a * b;
-    case "/":
-    case "%":
-      if (b === 0) fail(line, "#if 식에서 0으로 나눴습니다");
-      return op === "/" ? Math.trunc(a / b) : a % b;
-    default:
-      return fail(line, `#if 식의 연산자 ${op}`);
-  }
+const CHAR_ESC: Record<string, number> = {
+  n: 10,
+  t: 9,
+  r: 13,
+  a: 7,
+  b: 8,
+  f: 12,
+  v: 11,
+  "0": 0,
+  "\\": 92,
+  "'": 39,
+  '"': 34,
+  "?": 63,
+};
+// '\n'·'\x41'·'\101' 같은 문자 상수의 값(char 는 부호가 있다)
+function charValue(body: string): number {
+  let c: number;
+  if (body[0] !== "\\") c = body.charCodeAt(0);
+  else if (body[1] === "x") c = Number.parseInt(body.slice(2), 16);
+  else if (/[0-7]/.test(body[1])) c = Number.parseInt(body.slice(1, 4), 8);
+  else c = CHAR_ESC[body[1]] ?? body.charCodeAt(1);
+  return (c << 24) >> 24;
 }

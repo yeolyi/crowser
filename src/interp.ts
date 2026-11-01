@@ -407,7 +407,8 @@ type Func = {
   addr: number;
   type: FuncType;
   ret: CType;
-  params: { name: string; type: CType }[];
+  /** late: int a[n][n] 처럼 크기가 앞 매개변수에 달린 타입. 부를 때마다 그 값으로 다시 센다 */
+  params: { name: string; type: CType; late?: [Node, Node] }[];
   /** 매개변수 뒤에 ... 가 있다 */
   variadic: boolean;
   body: Node;
@@ -957,6 +958,8 @@ export function run(
       case "identifier":
       case "field_identifier":
       case "type_identifier":
+      // tree-sitter 는 int16_t 같은 표준 이름을 타입으로 읽는다. typedef 로 다시 정의할 때 그 자리가 이름이다
+      case "primitive_type":
         return { name: d.text, type: b };
       case "pointer_declarator":
         return declare(ptr(b), field(d, "declarator"));
@@ -1471,6 +1474,8 @@ export function run(
     return 0;
   }
 
+  // & 바로 안의 a[i] (그 식을 계산하는 동안만 뜻이 있다)
+  let pastEnd: Node | null = null;
   // 지금 실행 중인 곳(해석기 자체가 멈출 때 그 줄을 알리려고)
   let here: Node | null = null;
   const tick = (n: Node) => {
@@ -1617,6 +1622,8 @@ export function run(
             const p = rvalue(n, evalExpr(field(argNode, "argument")));
             if (p.t.k === "ptr") return p;
           }
+          // &a[n] 은 끝 바로 다음 주소라 써도 된다(따라가지만 않으면)
+          pastEnd = argNode;
           const x = evalExpr(argNode);
           if (x.t.k === "func")
             return { t: ptr(x.t), v: x.lv ? x.addr : num(x.v) };
@@ -1661,6 +1668,7 @@ export function run(
       }
       case "subscript_expression": {
         const arrayNode = field(n, "argument");
+        const allowEnd = pastEnd === n;
         let base0 = evalExpr(arrayNode);
         let i = rvalue(n, evalExpr(field(n, "index")));
         // a[i] 는 *(a + i) 라 i[a] 도 같다
@@ -1673,11 +1681,12 @@ export function run(
         if (a.t.k !== "ptr")
           return fail(n, "[] 앞은 배열이나 포인터여야 합니다");
         const iv = num(i.v);
+        const end = allowEnd ? 1 : 0;
         if (
           !dry &&
           base0.lv &&
           base0.t.k === "array" &&
-          (iv < 0 || iv >= base0.t.n)
+          (iv < 0 || iv >= base0.t.n + end)
         )
           fail(
             n,
@@ -2397,6 +2406,9 @@ export function run(
     );
   };
 
+  // 배열·함수 매개변수는 포인터다
+  const paramType = (t: CType) =>
+    t.k === "array" ? ptr(t.of) : t.k === "func" ? ptr(t) : t;
   function invoke(f: Func, args: Val[], at: Node): Val {
     const savedSp = sp;
     // 가변 인자: 기본 승격(float 는 double, 작은 정수는 int)을 한 값을 8바이트 칸에 차례로 놓는다
@@ -2422,9 +2434,12 @@ export function run(
     };
     frames.push(fr);
     f.params.forEach((p, i) => {
-      const addr = alloca(at, p.type);
-      fr.scopes[0].set(p.name, { addr, type: p.type });
-      assign(at, { t: p.type, addr, lv: true }, args[i]);
+      const type = p.late
+        ? paramType(declare(typeOf(p.late[0]), p.late[1]).type)
+        : p.type;
+      const addr = alloca(at, type);
+      fr.scopes[0].set(p.name, { addr, type });
+      assign(at, { t: type, addr, lv: true }, args[i]);
     });
     let ret: Val | null = null;
     try {
@@ -2912,7 +2927,7 @@ export function run(
           return fail(top, "함수 정의의 선언을 읽지 못했습니다");
         const { name } = decl;
         const ret = decl.type.ret;
-        const params: { name: string; type: CType }[] = [];
+        const params: Func["params"] = [];
         let variadic = false;
         for (const p of field(decl.fn, "parameters").namedChildren) {
           if (!p || p.type !== "parameter_declaration") {
@@ -2923,19 +2938,19 @@ export function run(
           const pd = p.childForFieldName("declarator");
           if (!pd) {
             if (pt.text === "void") continue;
-            fail(p, "매개변수 이름이 없습니다");
+            return fail(p, "매개변수 이름이 없습니다");
           }
-          const pdecl = declare(typeOf(pt), pd as Node);
-          // 배열·함수 매개변수는 포인터다
-          params.push({
-            name: pdecl.name,
-            type:
-              pdecl.type.k === "array"
-                ? ptr(pdecl.type.of)
-                : pdecl.type.k === "func"
-                  ? ptr(pdecl.type)
-                  : pdecl.type,
-          });
+          try {
+            const pdecl = declare(typeOf(pt), pd);
+            params.push({ name: pdecl.name, type: paramType(pdecl.type) });
+          } catch (e) {
+            if (!(e instanceof Fail)) throw e;
+            params.push({
+              name: declaredName(pd),
+              type: ptr(T.void),
+              late: [pt, pd],
+            });
+          }
         }
         const known = funcs.get(name);
         const f = {
