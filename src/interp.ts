@@ -151,6 +151,9 @@ const STREAMS: Record<string, number> = {
   stdout: 0x18,
   stderr: 0x20,
 };
+// fopen 으로 연 파일(FOPEN_MAX 개까지)
+const FILE_BASE = 0x40;
+const FILE_END = FILE_BASE + 20 * 8;
 
 const STD_TYPES: Record<string, CType> = {
   va_list: ptr(T.char),
@@ -322,7 +325,8 @@ const LIBRARY = Object.fromEntries(
     "isxdigit labs llabs malloc memcmp memcpy memmove memset printf putc putchar puts qsort rand realloc signbit " +
     "snprintf sprintf srand strcat strchr strcmp strcpy strlen strncat strncmp strncpy strrchr strstr strtod strtol " +
     "strtoll strtoul strtoull time tolower toupper sqrt fabs floor ceil round trunc sin cos tan asin acos atan sinh " +
-    "cosh tanh exp exp2 log log10 log2 cbrt pow fmod atan2 hypot fmin fmax fdim ldexp copysign"
+    "cosh tanh exp exp2 log log10 log2 cbrt pow fmod atan2 hypot fmin fmax fdim ldexp copysign " +
+    "fopen fclose fread fwrite fgetc getc fgets feof ferror rewind fseek ftell remove ungetc"
   )
     .split(" ")
     .map((name, i) => [0xc00 + i * 4, name]),
@@ -370,6 +374,12 @@ const BUILTIN_RET: Record<string, CType> = {
       .split(" ")
       .map((f) => [f, T.double]),
   ),
+  fopen: ptr(FILE),
+  fgets: ptr(T.char),
+  fread: T.ulong,
+  fwrite: T.ulong,
+  ftell: T.long,
+  rewind: T.void,
   srand: T.void,
   exit: T.void,
   abort: T.void,
@@ -561,12 +571,28 @@ const wideUnits = (s: string, utf16: boolean) => {
 // 문자열·문자 상수의 접두사(L"…", u'…')에 따른 글자 하나의 타입
 const PREFIX_TYPE: Record<string, CType> = { L: T.int, u: T.ushort, U: T.uint };
 
+// 실행은 두 번까지 한다. 먼저 줄마다 기록하며 limit 단계까지 돌고, 그 안에 끝나면 그 결과가 전부다.
+// 기록이 한도에 닿으면 기록 없이 처음부터 빠르게(JS 로 옮겨) 다시 돌려 출력·종료 코드·오류를 얻는다.
+// 같은 프로그램은 같게 돌아(입력이 없고 rand 도 씨앗이 같다) 기록은 빠른 실행의 앞부분과 같다
 export function run(
   src: string,
-  {
-    limit = 3000,
-    ops: opsLimit = OPS_LIMIT,
-  }: { limit?: number; ops?: number } = {},
+  { limit = 3000, ops }: { limit?: number; ops?: number } = {},
+): CResult {
+  if (limit > 0) {
+    const r = execute(src, { limit, ops });
+    if (!r.truncated && !r.error?.msg.startsWith("너무 오래")) return r;
+    const f = execute(src, { limit: 0, ops });
+    return { ...f, steps: r.steps, truncated: true };
+  }
+  return execute(src, { limit: 0, ops });
+}
+
+// 기록이 한도에 닿아 멈춘다
+class Stop {}
+
+function execute(
+  src: string,
+  { limit, ops: opsLimit = OPS_LIMIT }: { limit: number; ops?: number },
 ): CResult {
   const pre = preprocess(src);
   let root: Node | null = null;
@@ -631,7 +657,22 @@ export function run(
 
   // --- 메모리 읽기·쓰기 ---
   // 힙은 앞으로만 쌓으니(주소를 다시 쓰지 않는다) 그 주소 앞에서 시작한 마지막 블록이 그 주소의 주인이다
-  const blockAt = (addr: number) => heap.findLast((h) => h.addr <= addr);
+  const blockAt = (addr: number) => {
+    let lo = 0;
+    let hi = heap.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (heap[mid].addr <= addr) lo = mid;
+      else hi = mid - 1;
+    }
+    const b = heap[lo];
+    return b && b.addr <= addr ? b : undefined;
+  };
+  // 그 주소에서 시작하는 블록(malloc 이 돌려준 주소인가)
+  const blockStart = (addr: number) => {
+    const b = blockAt(addr);
+    return b?.addr === addr ? b : undefined;
+  };
   // sizeof 처럼 타입만 알면 되는 식은 계산하지 않는다(dry). 메모리를 읽고 쓰지 않고, 함수를 부르지 않고, 오류도 내지 않는다
   let dry = 0;
   // 실행 전 검사 중(맨 위 선언을 읽고 함수 몸통을 훑는 동안). 컴파일 오류는 이때나 dry 일 때만 따진다
@@ -736,6 +777,17 @@ export function run(
   };
   // C 정수 규칙: 타입 크기로 자른다
   function wrap(t: CType, v: Num): Num {
+    // 흔한 경우를 먼저: 비트 필드가 아닌 4바이트 이하 정수에 number. | 0 등은 C 처럼 2^n 으로 나눈 나머지다
+    if (t.k === "int" && t.bits === undefined && typeof v === "number")
+      switch (t.size) {
+        case 4:
+          return t.signed ? v | 0 : v >>> 0;
+        case 2:
+          return t.signed ? (v << 16) >> 16 : v & 0xffff;
+        case 1:
+          if (t.name === T.bool.name) return truth(v) ? 1 : 0;
+          return t.signed ? (v << 24) >> 24 : v & 0xff;
+      }
     if (t.k === "float") return t.size === 4 ? Math.fround(num(v)) : num(v);
     if (t.k !== "int") return num(v);
     if (t.name === T.bool.name) return truth(v) ? 1 : 0;
@@ -767,10 +819,13 @@ export function run(
   }
 
   // --- 타입 읽기 ---
+  const PRIMITIVES = new Map<string, CType>();
   const typeOf = (node: Node): CType => {
     switch (node.type) {
       case "primitive_type":
       case "sized_type_specifier": {
+        const known = PRIMITIVES.get(node.text);
+        if (known) return known;
         if (node.text === "signed char") return T.schar;
         const s = node.text
           .replace(/\s+/g, " ")
@@ -797,11 +852,12 @@ export function run(
           "unsigned long": T.ulong,
           "unsigned long long": T.ulong,
         };
-        return (
+        const t =
           map[s] ??
           STD_TYPES[s] ??
-          fail(node, `지원하지 않는 타입 ${node.text}`)
-        );
+          fail(node, `지원하지 않는 타입 ${node.text}`);
+        PRIMITIVES.set(node.text, t);
+        return t;
       }
       case "type_identifier": {
         const local = findScoped(node.text);
@@ -1292,9 +1348,10 @@ export function run(
     strings.set(s, a);
     return a;
   };
-  const readStr = (n: Node, a: number) => {
+  // max: 그만큼만 읽는다(printf 의 %.3s 는 끝에 0 이 없는 배열도 받는다)
+  const readStr = (n: Node, a: number, max = 100000) => {
     let s = "";
-    for (let i = 0; i < 100000; i++) {
+    for (let i = 0; i < max; i++) {
       const c = num(load(n, a + i, T.uchar));
       if (c === 0) return s;
       s += String.fromCharCode(c);
@@ -1507,7 +1564,7 @@ export function run(
       place.t.to.k !== "void" &&
       num(val.v) >= heapBase
     ) {
-      const b = heap.find((h) => h.addr === val.v);
+      const b = blockStart(num(val.v));
       if (b && !b.ctype) b.ctype = place.t.to;
     }
     if (place.t.k === "struct")
@@ -1678,6 +1735,10 @@ export function run(
   };
 
   function evalExpr(n: Node): X {
+    if (dry || checking) return evalSlow(n);
+    return codeOf(n)();
+  }
+  function evalSlow(n: Node): X {
     tick(n);
     switch (n.type) {
       case "number_literal": {
@@ -2008,52 +2069,7 @@ export function run(
         const pick = field(n, yes ? "consequence" : "alternative");
         const otherNode = field(n, yes ? "alternative" : "consequence");
         const v = rvalue(n, evalExpr(pick));
-        // 두 갈래가 다 수면 둘의 공통 타입으로(고르지 않은 쪽은 타입만 본다)
-        const o = decay(typeOnly(otherNode));
-        const vt = decay(v.t);
-        if (isArith(vt) && isArith(o)) {
-          const t =
-            isDouble(v.t) || isDouble(o)
-              ? T.double
-              : v.t.k === "float" || o.k === "float"
-                ? T.float
-                : promote(v.t, o);
-          return { t, v: wrap(t, v.v) };
-        }
-        // 포인터와 포인터(한쪽이 void * 면 void *), 포인터와 널 포인터 상수면 포인터 타입
-        if (vt.k === "ptr" || o.k === "ptr") {
-          const mismatch = () =>
-            fail(
-              n,
-              `?: 의 두 갈래 타입(${typeName(vt)}, ${typeName(o)})이 맞지 않습니다`,
-            );
-          if (vt.k === "ptr" && o.k === "ptr") {
-            if (strict() && !ptrCompat(vt, o)) mismatch();
-            // 결과는 두 쪽 한정자를 다 가진 것을 가리킨다
-            const to = (o.to.k === "void" ? o : vt).to;
-            return {
-              t: ptr(qualify(to, (vt.to.q ?? 0) | (o.to.q ?? 0))),
-              v: v.v,
-            };
-          }
-          if (strict() && !isNullConst(vt.k === "ptr" ? otherNode : pick))
-            mismatch();
-          return { t: vt.k === "ptr" ? vt : o, v: v.v };
-        }
-        if (
-          strict() &&
-          !(vt.k === "void" && o.k === "void") &&
-          !(
-            vt.k === "struct" &&
-            o.k === "struct" &&
-            unqualified(vt) === unqualified(o)
-          )
-        )
-          fail(
-            n,
-            `?: 의 두 갈래 타입(${typeName(vt)}, ${typeName(o)})이 맞지 않습니다`,
-          );
-        return v;
+        return choose(n, v, decay(typeOnly(otherNode)), pick, otherNode);
       }
       case "call_expression":
         return call(n);
@@ -2077,6 +2093,857 @@ export function run(
         return fail(n, `지원하지 않는 식 ${n.type}`);
     }
   }
+  // ?: 의 값: 고른 갈래의 값 v 를 다른 갈래의 타입 o 와 맞춘다
+  const choose = (
+    n: Node,
+    v: Val,
+    o: CType,
+    pick: Node,
+    otherNode: Node,
+  ): X => {
+    // 두 갈래가 다 수면 둘의 공통 타입으로(고르지 않은 쪽은 타입만 본다)
+    const vt = decay(v.t);
+    if (isArith(vt) && isArith(o)) {
+      const t =
+        isDouble(v.t) || isDouble(o)
+          ? T.double
+          : v.t.k === "float" || o.k === "float"
+            ? T.float
+            : promote(v.t, o);
+      return { t, v: wrap(t, v.v) };
+    }
+    // 포인터와 포인터(한쪽이 void * 면 void *), 포인터와 널 포인터 상수면 포인터 타입
+    if (vt.k === "ptr" || o.k === "ptr") {
+      const mismatch = () =>
+        fail(
+          n,
+          `?: 의 두 갈래 타입(${typeName(vt)}, ${typeName(o)})이 맞지 않습니다`,
+        );
+      if (vt.k === "ptr" && o.k === "ptr") {
+        if (strict() && !ptrCompat(vt, o)) mismatch();
+        // 결과는 두 쪽 한정자를 다 가진 것을 가리킨다
+        const to = (o.to.k === "void" ? o : vt).to;
+        return {
+          t: ptr(qualify(to, (vt.to.q ?? 0) | (o.to.q ?? 0))),
+          v: v.v,
+        };
+      }
+      if (strict() && !isNullConst(vt.k === "ptr" ? otherNode : pick))
+        mismatch();
+      return { t: vt.k === "ptr" ? vt : o, v: v.v };
+    }
+    if (
+      strict() &&
+      !(vt.k === "void" && o.k === "void") &&
+      !(
+        vt.k === "struct" &&
+        o.k === "struct" &&
+        unqualified(vt) === unqualified(o)
+      )
+    )
+      fail(
+        n,
+        `?: 의 두 갈래 타입(${typeName(vt)}, ${typeName(o)})이 맞지 않습니다`,
+      );
+    return v;
+  };
+
+  // --- 빠른 실행 ---
+  // 실행 중에 처음 계산하는 식을 함수로 바꿔 노드에 달아 둔다. 노드 종류·연산자·타입은 그 자리에서 늘
+  // 같으니 한 번만 보고, 다음부턴 값만 셈한다. 검사(dry)와 드문 식은 evalSlow 가 한다
+  type Code = () => X;
+  const codeOf = (n: Node): Code => {
+    let c = n.code as Code | undefined;
+    if (!c) {
+      c = compile(n);
+      n.code = c;
+    }
+    return c;
+  };
+  // 식을 값으로 쓸 때의 타입(rvalue 와 같은 규칙)
+  const rtype = (t: CType): CType =>
+    t.k === "array"
+      ? ptr(t.of)
+      : t.k === "func"
+        ? t
+        : unqualified(valueType(t));
+  // int 이하 정수 둘의 연산(가장 흔한 것)을 승격·자르기까지 한 번에. 결과 타입이 4바이트가 아니면 null
+  // int 이하 정수 둘의 연산(가장 흔한 것)을 승격·자르기까지 한 번에. 결과 타입이 4바이트가 아니면 null
+  type Op2 = (n: Node, x: number, y: number) => number;
+  const int32 = (
+    op: string,
+    a: CType,
+    b: CType,
+  ): { t: IntType; f: Op2 } | null => {
+    if (a.k !== "int" || b.k !== "int") return null;
+    const shift = op === "<<" || op === ">>";
+    const t = shift ? promote(a, a) : promote(a, b);
+    if (t.size !== 4) return null;
+    const f = t.signed ? signed32(op) : unsigned32(op);
+    if (!f) return null;
+    return { t: CMP.has(op) ? T.int : t, f };
+  };
+  const CMP = new Set(["<", ">", "<=", ">=", "==", "!="]);
+  const zero = (n: Node) => fail(n, "0으로 나눴습니다");
+  const signed32 = (op: string): Op2 | null => {
+    switch (op) {
+      case "+":
+        return (_, x, y) => (x + y) | 0;
+      case "-":
+        return (_, x, y) => (x - y) | 0;
+      case "*":
+        return (_, x, y) => Math.imul(x, y);
+      case "/":
+        return (n, x, y) => (y === 0 ? zero(n) : (x / y) | 0);
+      case "%":
+        return (n, x, y) => (y === 0 ? zero(n) : (x % y) | 0);
+      case "&":
+        return (_, x, y) => x & y;
+      case "|":
+        return (_, x, y) => x | y;
+      case "^":
+        return (_, x, y) => x ^ y;
+      case "<<":
+        return (_, x, y) => x << y;
+      case ">>":
+        return (_, x, y) => x >> y;
+    }
+    return compare(op);
+  };
+  // unsigned int: 값을 먼저 0 ~ 2^32-1 로
+  const u = (x: number) => x >>> 0;
+  const unsigned32 = (op: string): Op2 | null => {
+    switch (op) {
+      case "+":
+        return (_, x, y) => (x + y) >>> 0;
+      case "-":
+        return (_, x, y) => (x - y) >>> 0;
+      case "*":
+        return (_, x, y) => Math.imul(x, y) >>> 0;
+      case "/":
+        return (n, x, y) => (u(y) === 0 ? zero(n) : (u(x) / u(y)) >>> 0);
+      case "%":
+        return (n, x, y) => (u(y) === 0 ? zero(n) : (u(x) % u(y)) >>> 0);
+      case "&":
+        return (_, x, y) => (x & y) >>> 0;
+      case "|":
+        return (_, x, y) => (x | y) >>> 0;
+      case "^":
+        return (_, x, y) => (x ^ y) >>> 0;
+      case "<<":
+        return (_, x, y) => (x << y) >>> 0;
+      case ">>":
+        return (_, x, y) => u(x) >>> y;
+    }
+    const c = compare(op);
+    return c && ((n, x, y) => c(n, u(x), u(y)));
+  };
+  const compare = (op: string): Op2 | null => {
+    switch (op) {
+      case "<":
+        return (_, x, y) => (x < y ? 1 : 0);
+      case ">":
+        return (_, x, y) => (x > y ? 1 : 0);
+      case "<=":
+        return (_, x, y) => (x <= y ? 1 : 0);
+      case ">=":
+        return (_, x, y) => (x >= y ? 1 : 0);
+      case "==":
+        return (_, x, y) => (x === y ? 1 : 0);
+      case "!=":
+        return (_, x, y) => (x !== y ? 1 : 0);
+    }
+    return null;
+  };
+  // 숫자 하나로 읽고 쓰는 값(4바이트 이하 정수, 실수, 포인터. 비트 필드는 빼고)
+  type NumCode = () => number;
+  const numeric = (t: CType) =>
+    (t.k === "int" && t.size <= 4 && t.bits === undefined) ||
+    t.k === "float" ||
+    t.k === "ptr";
+  const loader = (t: CType): ((n: Node, a: number) => number) => {
+    if (t.k === "float")
+      return t.size === 4
+        ? (n, a) => {
+            check(n, a, 4);
+            return mem.getFloat32(a, true);
+          }
+        : (n, a) => {
+            check(n, a, 8);
+            return mem.getFloat64(a, true);
+          };
+    if (t.k === "ptr")
+      return (n, a) => {
+        check(n, a, 8);
+        return mem.getUint32(a, true) + mem.getUint32(a + 4, true) * 2 ** 32;
+      };
+    const signed = t.k === "int" && t.signed;
+    if (t.size === 1)
+      return signed
+        ? (n, a) => {
+            check(n, a, 1);
+            return mem.getInt8(a);
+          }
+        : (n, a) => {
+            check(n, a, 1);
+            return mem.getUint8(a);
+          };
+    if (t.size === 2)
+      return signed
+        ? (n, a) => {
+            check(n, a, 2);
+            return mem.getInt16(a, true);
+          }
+        : (n, a) => {
+            check(n, a, 2);
+            return mem.getUint16(a, true);
+          };
+    return signed
+      ? (n, a) => {
+          check(n, a, 4);
+          return mem.getInt32(a, true);
+        }
+      : (n, a) => {
+          check(n, a, 4);
+          return mem.getUint32(a, true);
+        };
+  };
+  // 이미 그 타입으로 자른 값을 쓴다
+  const storer = (t: CType): ((n: Node, a: number, v: number) => void) => {
+    if (t.k === "float") return (n, a, v) => store(n, a, t, v);
+    if (t.k === "ptr")
+      return (n, a, v) => {
+        if (v >= 0 && v < 2 ** 32) {
+          check(n, a, 8);
+          mem.setUint32(a, v, true);
+          mem.setUint32(a + 4, 0, true);
+        } else store(n, a, t, v);
+      };
+    if (t.size === 1)
+      return (n, a, v) => {
+        check(n, a, 1);
+        mem.setUint8(a, v & 0xff);
+      };
+    if (t.size === 2)
+      return (n, a, v) => {
+        check(n, a, 2);
+        mem.setUint16(a, v & 0xffff, true);
+      };
+    return (n, a, v) => {
+      check(n, a, 4);
+      mem.setUint32(a, v >>> 0, true);
+    };
+  };
+  // 두 숫자 값의 연산. 결과 타입과 함께. 실수가 끼거나 8바이트 정수면 null(일반 길로)
+  const numBinop = (
+    op: string,
+    a: CType,
+    b: CType,
+  ): { t: CType; f: Op2 } | null => {
+    const i = int32(op, a, b);
+    if (i) return i;
+    // 포인터 ± 정수, 포인터끼리 견주기
+    if (a.k === "ptr" && b.k === "int" && b.size <= 4) {
+      const size = Math.max(a.to.size, 1);
+      if (op === "+") return { t: a, f: (_, x, y) => x + y * size };
+      if (op === "-") return { t: a, f: (_, x, y) => x - y * size };
+    }
+    if (a.k === "int" && a.size <= 4 && b.k === "ptr" && op === "+") {
+      const size = Math.max(b.to.size, 1);
+      return { t: b, f: (_, x, y) => y + x * size };
+    }
+    const c = compare(op);
+    if (
+      c &&
+      (a.k === "ptr" || b.k === "ptr") &&
+      a.k !== "float" &&
+      b.k !== "float"
+    )
+      return { t: T.int, f: c };
+    return null;
+  };
+
+  const numMemo = new Map<Node, NumCode | null>();
+  const addrMemo = new Map<Node, NumCode | null>();
+  const numCode = (n: Node): NumCode | null => {
+    let c = numMemo.get(n);
+    if (c === undefined) {
+      c = buildNum(n);
+      numMemo.set(n, c);
+    }
+    return c;
+  };
+  const addrCode = (n: Node): NumCode | null => {
+    let c = addrMemo.get(n);
+    if (c === undefined) {
+      c = buildAddr(n);
+      addrMemo.set(n, c);
+    }
+    return c;
+  };
+  // 이름이 변수면 그 자리. 선언은 글자 자리로 정해지고 지역 변수의 자리는 호출마다 하나라
+  // 호출(frame)이 같으면 찾은 자리를 그대로 쓴다. 전역은 늘 같다
+  const varAddr = (n: Node): NumCode | null => {
+    const name = n.text;
+    const local = findScoped(name);
+    const variable = local
+      ? !local.kind
+      : !enums.has(name) && globals.has(name);
+    if (!variable) return null;
+    if (!local) {
+      let g: Binding | undefined;
+      return () => {
+        tick(n);
+        g ??= lookup(n, name);
+        return g.addr;
+      };
+    }
+    let seen: unknown = null;
+    let addr = 0;
+    return () => {
+      tick(n);
+      const f = frames[frames.length - 1];
+      if (f !== seen) {
+        addr = lookup(n, name).addr;
+        seen = f;
+      }
+      return addr;
+    };
+  };
+  const PLACES = new Set([
+    "identifier",
+    "subscript_expression",
+    "field_expression",
+    "pointer_expression",
+  ]);
+  // 자리(lvalue)의 주소를 셈하는 함수
+  const buildAddr = (n: Node): NumCode | null => {
+    switch (n.type) {
+      case "identifier":
+        return varAddr(n);
+      case "parenthesized_expression": {
+        const inner = n.namedChildren[0];
+        return inner ? addrCode(inner) : null;
+      }
+      case "subscript_expression": {
+        const arrayNode = field(n, "argument");
+        const bt = typeOnly(arrayNode);
+        const I = numCode(field(n, "index"));
+        const it = rtype(typeOnly(field(n, "index")));
+        if (!I || it.k !== "int") return null;
+        if (bt.k === "array") {
+          const A = addrCode(arrayNode);
+          if (!A) return null;
+          const size = bt.of.size;
+          const len = bt.n;
+          return () => {
+            tick(n);
+            const end = pastEnd === n ? 1 : 0;
+            const a = A();
+            const i = I();
+            if (len > 0 && (i < 0 || i >= len + end))
+              fail(
+                n,
+                `배열 ${arrayNode.text}[${len}]의 범위 밖 인덱스 ${i}입니다`,
+              );
+            return a + i * size;
+          };
+        }
+        if (bt.k !== "ptr") return null;
+        const P = numCode(arrayNode);
+        if (!P) return null;
+        const size = bt.to.size;
+        return () => {
+          tick(n);
+          const p = P();
+          return p + I() * size;
+        };
+      }
+      case "pointer_expression": {
+        if (field(n, "operator").text !== "*") return null;
+        const arg = field(n, "argument");
+        const pt = rtype(typeOnly(arg));
+        const P = numCode(arg);
+        if (!P || pt.k !== "ptr") return null;
+        return () => {
+          tick(n);
+          const p = P();
+          if (p === 0) fail(n, "NULL 포인터를 따라갔습니다");
+          return p;
+        };
+      }
+      case "field_expression": {
+        const arrow = field(n, "operator").text === "->";
+        const argNode = field(n, "argument");
+        const at = arrow ? rtype(typeOnly(argNode)) : typeOnly(argNode);
+        const st = arrow ? (at.k === "ptr" ? at.to : null) : at;
+        if (st?.k !== "struct") return null;
+        const fname = field(n, "field").text;
+        const f = st.fields?.find((x) => x.name === fname);
+        if (!f) return null;
+        const off = f.offset;
+        if (arrow) {
+          const P = numCode(argNode);
+          if (!P) return null;
+          return () => {
+            tick(n);
+            const p = P();
+            if (p === 0 && !addressOnly.has(n))
+              fail(n, "NULL 포인터를 따라갔습니다");
+            return p + off;
+          };
+        }
+        const B = addrCode(argNode);
+        if (!B) return null;
+        return () => {
+          tick(n);
+          return B() + off;
+        };
+      }
+      default:
+        return null;
+    }
+  };
+  // 숫자 값으로 셈하는 함수. 값을 { t, v } 로 싸지 않아 빠르다
+  const buildNum = (n: Node): NumCode | null => {
+    const t = rtype(typeOnly(n));
+    if (!numeric(t)) return null;
+    switch (n.type) {
+      case "number_literal":
+      case "char_literal":
+      case "alignof_expression":
+      case "offsetof_expression":
+      case "sizeof_expression": {
+        const v = num((evalSlow(n) as Val).v);
+        return () => {
+          tick(n);
+          return v;
+        };
+      }
+      case "parenthesized_expression": {
+        const inner = n.namedChildren[0];
+        return inner ? numCode(inner) : null;
+      }
+      case "comma_expression": {
+        const L = codeOf(field(n, "left"));
+        const R = numCode(field(n, "right"));
+        if (!R) return null;
+        return () => {
+          tick(n);
+          L();
+          return R();
+        };
+      }
+      case "identifier":
+      case "subscript_expression":
+      case "field_expression":
+      case "pointer_expression": {
+        const pt = typeOnly(n);
+        if (pt.k !== "array" && !numeric(pt)) return null;
+        const A = addrCode(n);
+        if (!A) return null;
+        if (pt.k === "array") return A;
+        const ld = loader(pt);
+        return () => ld(n, A());
+      }
+      case "binary_expression": {
+        const op = field(n, "operator").text;
+        const left = field(n, "left");
+        const right = field(n, "right");
+        const A = numCode(left);
+        const B = numCode(right);
+        if (!A || !B) return null;
+        if (op === "&&")
+          return () => {
+            tick(n);
+            return A() !== 0 && B() !== 0 ? 1 : 0;
+          };
+        if (op === "||")
+          return () => {
+            tick(n);
+            return A() !== 0 || B() !== 0 ? 1 : 0;
+          };
+        const bin = numBinop(op, rtype(typeOnly(left)), rtype(typeOnly(right)));
+        if (!bin) return null;
+        const f = bin.f;
+        return () => {
+          tick(n);
+          const x = A();
+          return f(n, x, B());
+        };
+      }
+      case "unary_expression": {
+        const op = field(n, "operator").text;
+        const A = numCode(field(n, "argument"));
+        if (!A) return null;
+        if (op === "!")
+          return () => {
+            tick(n);
+            return A() !== 0 ? 0 : 1;
+          };
+        if (op === "+") return A;
+        if (op === "-")
+          return () => {
+            tick(n);
+            return wrap(t, -A()) as number;
+          };
+        if (op === "~" && t.k === "int" && t.size === 4)
+          return () => {
+            tick(n);
+            return wrap(t, ~A()) as number;
+          };
+        return null;
+      }
+      case "cast_expression": {
+        const A = numCode(field(n, "value"));
+        if (!A) return null;
+        return () => {
+          tick(n);
+          return wrap(t, A()) as number;
+        };
+      }
+      case "conditional_expression": {
+        const C = numCode(field(n, "condition"));
+        const Y = numCode(field(n, "consequence"));
+        const N = numCode(field(n, "alternative"));
+        if (!C || !Y || !N) return null;
+        return () => {
+          tick(n);
+          return wrap(t, C() !== 0 ? Y() : N()) as number;
+        };
+      }
+      case "assignment_expression": {
+        const op = field(n, "operator").text;
+        const left = field(n, "left");
+        const pt = typeOnly(left);
+        if (!numeric(pt)) return null;
+        const A = addrCode(left);
+        const R = numCode(field(n, "right"));
+        if (!A || !R) return null;
+        const ld = loader(pt);
+        const st = storer(pt);
+        const rt = rtype(typeOnly(field(n, "right")));
+        const heapPtr = pt.k === "ptr" && pt.to.k !== "void" ? pt.to : null;
+        const bin =
+          op === "=" ? null : numBinop(op.slice(0, -1), unqualified(pt), rt);
+        if (op !== "=" && !bin) return null;
+        const f = bin?.f;
+        return () => {
+          tick(n);
+          const a = A();
+          let v = f ? f(n, ld(n, a), R()) : R();
+          v = wrap(pt, v) as number;
+          // malloc 이 준 블록은 처음 담긴 포인터의 타입으로 보인다
+          if (heapPtr && v >= heapBase) {
+            const b = blockStart(v);
+            if (b && !b.ctype) b.ctype = heapPtr;
+          }
+          st(n, a, v);
+          return v;
+        };
+      }
+      case "update_expression": {
+        const op = field(n, "operator").text;
+        const arg = field(n, "argument");
+        const pt = typeOnly(arg);
+        if (!numeric(pt)) return null;
+        const prefix = n.firstChild?.type === op;
+        const A = addrCode(arg);
+        if (!A) return null;
+        const ld = loader(pt);
+        const st = storer(pt);
+        const d =
+          (op === "++" ? 1 : -1) *
+          (pt.k === "ptr" ? Math.max(pt.to.size, 1) : 1);
+        return () => {
+          tick(n);
+          const a = A();
+          const old = ld(n, a);
+          const v = wrap(pt, old + d) as number;
+          st(n, a, v);
+          return prefix ? v : old;
+        };
+      }
+      default:
+        return null;
+    }
+  };
+  const compile = (n: Node): Code => {
+    // 숫자 하나로 셈할 수 있으면 그 함수를 감싼다. 괄호는 안이 자리일 수도 있어 아래에서
+    if (n.type !== "parenthesized_expression") {
+      const t = typeOnly(n);
+      if (PLACES.has(n.type)) {
+        const A = addrCode(n);
+        if (A) return () => ({ t, addr: A(), lv: true });
+      } else {
+        const N = numCode(n);
+        const rt = rtype(t);
+        if (N) return () => ({ t: rt, v: N() });
+      }
+    }
+    const slow: Code = () => evalSlow(n);
+    switch (n.type) {
+      // 값이 늘 같은 식
+      case "number_literal":
+      case "char_literal":
+      case "sizeof_expression":
+      case "alignof_expression":
+      case "offsetof_expression": {
+        const { t, v } = evalSlow(n) as Val;
+        return () => {
+          tick(n);
+          return { t, v };
+        };
+      }
+      case "identifier": {
+        const name = n.text;
+        const local = findScoped(name);
+        const variable = local
+          ? !local.kind
+          : !enums.has(name) && globals.has(name);
+        if (!variable) return slow;
+        // 이름이 가리키는 선언은 글자 자리로 정해지고, 지역 변수의 자리는 호출마다 하나라
+        // 호출(frame)이 같으면 찾은 자리를 그대로 쓴다. 전역은 늘 같다
+        if (!local) {
+          let g: Binding | undefined;
+          return () => {
+            tick(n);
+            g ??= lookup(n, name);
+            return { t: g.type, addr: g.addr, lv: true };
+          };
+        }
+        let seen: unknown = null;
+        let b: Binding | undefined;
+        return () => {
+          tick(n);
+          const f = frames[frames.length - 1];
+          if (f !== seen || !b) {
+            b = lookup(n, name);
+            seen = f;
+          }
+          return { t: b.type, addr: b.addr, lv: true };
+        };
+      }
+      case "parenthesized_expression": {
+        const inner = n.namedChildren[0];
+        return inner ? codeOf(inner) : slow;
+      }
+      case "comma_expression": {
+        const L = codeOf(field(n, "left"));
+        const R = codeOf(field(n, "right"));
+        return () => {
+          tick(n);
+          L();
+          return R();
+        };
+      }
+      case "binary_expression": {
+        const op = field(n, "operator").text;
+        const left = field(n, "left");
+        const right = field(n, "right");
+        const A = codeOf(left);
+        const B = codeOf(right);
+        if (op === "&&")
+          return () => {
+            tick(n);
+            return {
+              t: T.int,
+              v: truth(rvalue(n, A()).v) && truth(rvalue(n, B()).v) ? 1 : 0,
+            };
+          };
+        if (op === "||")
+          return () => {
+            tick(n);
+            return {
+              t: T.int,
+              v: truth(rvalue(n, A()).v) || truth(rvalue(n, B()).v) ? 1 : 0,
+            };
+          };
+        return () => {
+          tick(n);
+          const a = rvalue(n, A());
+          return arith(n, op, a, rvalue(n, B()));
+        };
+      }
+      case "unary_expression": {
+        const op = field(n, "operator").text;
+        const A = codeOf(field(n, "argument"));
+        return () => {
+          tick(n);
+          const a = rvalue(n, A());
+          const t = a.t.k === "int" && a.t.size < 4 ? T.int : a.t;
+          if (op === "-") return { t, v: wrap(t, neg(a.v)) };
+          if (op === "+") return { t, v: a.v };
+          if (op === "!") return { t: T.int, v: truth(a.v) ? 0 : 1 };
+          return { t, v: wrap(t, t.size === 8 ? ~big(a.v) : ~num(a.v)) };
+        };
+      }
+      case "assignment_expression": {
+        const op = field(n, "operator").text;
+        const bop = op.slice(0, -1);
+        const left = field(n, "left");
+        const L = codeOf(left);
+        const R = codeOf(field(n, "right"));
+        const pt = typeOnly(left);
+        // 비트 필드가 아닌 정수·실수 자리에 = 이면 자르고 저장하면 끝
+        if (
+          op === "=" &&
+          ((pt.k === "int" && pt.bits === undefined) || pt.k === "float")
+        ) {
+          const rt = unqualified(pt);
+          return () => {
+            tick(n);
+            const place = L() as Place;
+            const v = wrap(pt, rvalue(n, R()).v);
+            store(n, place.addr, pt, v);
+            return { t: rt, v };
+          };
+        }
+        return () => {
+          tick(n);
+          const place = L();
+          let val = rvalue(n, R());
+          if (op !== "=") val = arith(n, bop, rvalue(n, place), val);
+          assign(n, place, val);
+          return { t: valueType(place.t), v: wrap(place.t, val.v) };
+        };
+      }
+      case "update_expression": {
+        const op = field(n, "operator").text;
+        const bop = op === "++" ? "+" : "-";
+        const prefix = n.firstChild?.type === op;
+        const arg = field(n, "argument");
+        const A = codeOf(arg);
+        const one: Val = { t: T.int, v: 1 };
+        const pt = typeOnly(arg);
+        if (pt.k === "int" && pt.bits === undefined && pt.size === 4) {
+          const rt = unqualified(pt);
+          const d = op === "++" ? 1 : -1;
+          return () => {
+            tick(n);
+            const { addr } = A() as Place;
+            const old = load(n, addr, pt) as number;
+            const v = pt.signed ? (old + d) | 0 : (old + d) >>> 0;
+            store(n, addr, pt, v);
+            return { t: rt, v: prefix ? v : old };
+          };
+        }
+        return () => {
+          tick(n);
+          const place = A();
+          const old = rvalue(n, place);
+          const nv = arith(n, bop, old, one);
+          assign(n, place, nv);
+          return prefix ? { t: old.t, v: wrap(place.t, nv.v) } : old;
+        };
+      }
+      case "pointer_expression": {
+        if (field(n, "operator").text !== "*") return slow;
+        const P = codeOf(field(n, "argument"));
+        return () => {
+          tick(n);
+          const p = rvalue(n, P());
+          if (p.t.k !== "ptr")
+            return fail(n, "포인터가 아닌 것을 따라갔습니다");
+          if (p.v === 0) fail(n, "NULL 포인터를 따라갔습니다");
+          return { t: p.t.to, addr: num(p.v), lv: true };
+        };
+      }
+      case "subscript_expression": {
+        const arrayNode = field(n, "argument");
+        const indexNode = field(n, "index");
+        const A = codeOf(arrayNode);
+        const I = codeOf(indexNode);
+        // i[a] 는 a[i] 와 같다
+        const swapped =
+          rtype(typeOnly(arrayNode)).k === "int" &&
+          rtype(typeOnly(indexNode)).k === "ptr";
+        return () => {
+          tick(n);
+          const end = pastEnd === n ? 1 : 0;
+          let base0: X;
+          let i: Val;
+          if (swapped) {
+            i = rvalue(n, A());
+            base0 = rvalue(n, I());
+          } else {
+            base0 = A();
+            i = rvalue(n, I());
+          }
+          const a = rvalue(n, base0);
+          if (a.t.k !== "ptr")
+            return fail(n, "[] 앞은 배열이나 포인터여야 합니다");
+          const iv = num(i.v);
+          if (
+            base0.lv &&
+            base0.t.k === "array" &&
+            base0.t.n > 0 &&
+            (iv < 0 || iv >= base0.t.n + end)
+          )
+            fail(
+              n,
+              `배열 ${arrayNode.text}[${base0.t.n}]의 범위 밖 인덱스 ${iv}입니다`,
+            );
+          return { t: a.t.to, addr: num(a.v) + iv * a.t.to.size, lv: true };
+        };
+      }
+      case "field_expression": {
+        const arrow = field(n, "operator").text === "->";
+        const argNode = field(n, "argument");
+        const at = rtype(typeOnly(argNode));
+        const st = arrow ? (at.k === "ptr" ? at.to : null) : typeOnly(argNode);
+        if (st?.k !== "struct") return slow;
+        const fname = field(n, "field").text;
+        const f = st.fields?.find((x) => x.name === fname);
+        if (!f) return slow;
+        const t = qualify(f.type, st.q ?? 0);
+        const B = codeOf(argNode);
+        return () => {
+          tick(n);
+          const b = B();
+          if (arrow) {
+            const addr = num(rvalue(n, b).v);
+            if (addr === 0 && !addressOnly.has(n))
+              fail(n, "NULL 포인터를 따라갔습니다");
+            return { t, addr: addr + f.offset, lv: true };
+          }
+          const addr = b.lv ? b.addr : num(b.v);
+          return {
+            t,
+            addr: addr + f.offset,
+            lv: true,
+            temp: !b.lv || !!b.temp,
+          };
+        };
+      }
+      case "cast_expression": {
+        const t = unqualified(typeOfDescriptor(field(n, "type")));
+        const A = codeOf(field(n, "value"));
+        return () => {
+          tick(n);
+          const x = rvalue(n, A());
+          return t.k === "void" ? { t, v: 0 } : { t, v: wrap(t, x.v) };
+        };
+      }
+      case "conditional_expression": {
+        const cons = field(n, "consequence");
+        const alt = field(n, "alternative");
+        const C = codeOf(field(n, "condition"));
+        const Y = codeOf(cons);
+        const N = codeOf(alt);
+        const oYes = decay(typeOnly(alt));
+        const oNo = decay(typeOnly(cons));
+        return () => {
+          tick(n);
+          if (truth(rvalue(n, C()).v))
+            return choose(n, rvalue(n, Y()), oYes, cons, alt);
+          return choose(n, rvalue(n, N()), oNo, alt, cons);
+        };
+      }
+      default:
+        return slow;
+    }
+  };
   const lookupMaybe = (name: string) => {
     const f = frame();
     if (f) for (const s of f.scopes) if (s.has(name)) return true;
@@ -2361,7 +3228,7 @@ export function run(
         const size = argN(1);
         const r = heapAlloc(size, n);
         if (old) {
-          const b = heap.find((h) => h.addr === old && !h.freed);
+          const b = [blockStart(old)].find((h) => h && !h.freed);
           if (!b) fail(n, "malloc 으로 받지 않은 주소를 realloc 했습니다");
           else {
             copy(n, r, old, Math.min(b.size, size));
@@ -2373,7 +3240,7 @@ export function run(
       case "free": {
         const a = argN(0);
         if (a === 0) return { t: T.void, v: 0 };
-        const b = heap.find((h) => h.addr === a);
+        const b = blockStart(a);
         if (!b) fail(n, "malloc 으로 받지 않은 주소를 free 했습니다");
         else if (b.freed) fail(n, "같은 메모리를 두 번 free 했습니다");
         else b.freed = true;
@@ -2386,7 +3253,7 @@ export function run(
       }
       case "fprintf": {
         const s = format(n, readStr(n, argN(1)), args.slice(2));
-        out += s;
+        put(n, argN(0), s);
         return { t: T.int, v: s.length };
       }
       case "putchar":
@@ -2490,6 +3357,57 @@ export function run(
     return fail(n, `선언하지 않은 함수 ${name}`);
   }
   // --- 표준 라이브러리(더한 것) ---
+  // 파일은 메모리 안에만 있다(실행마다 비어서 시작한다). fopen 이 주는 FILE * 는 stdin 등처럼 가짜 주소
+  const files = new Map<string, string>();
+  type Open = {
+    name: string;
+    pos: number;
+    read: boolean;
+    write: boolean;
+    append: boolean;
+    eof: boolean;
+    // ungetc 로 되돌린 글자
+    back: number[];
+  };
+  const opened = new Map<number, Open>();
+  const handle = (n: Node, f: number) =>
+    opened.get(f) ??
+    fail(
+      n,
+      f === 0
+        ? "NULL 인 FILE * 를 썼습니다. fopen 이 실패했는지 봅니다"
+        : "열려 있지 않은 FILE * 입니다",
+    );
+  const put = (n: Node, f: number, s: string) => {
+    if (f === STREAMS.stdout || f === STREAMS.stderr) {
+      out += s;
+      return;
+    }
+    const o = handle(n, f);
+    if (!o.write) fail(n, "읽기로 연 파일에 썼습니다");
+    const text = files.get(o.name) ?? "";
+    if (o.append) o.pos = text.length;
+    files.set(
+      o.name,
+      text.slice(0, o.pos).padEnd(o.pos, "\0") +
+        s +
+        text.slice(o.pos + s.length),
+    );
+    o.pos += s.length;
+  };
+  const getc = (n: Node, f: number) => {
+    if (f === STREAMS.stdin) return -1;
+    const o = handle(n, f);
+    if (!o.read) fail(n, "쓰기로 연 파일에서 읽었습니다");
+    const b = o.back.pop();
+    if (b !== undefined) return b;
+    const text = files.get(o.name) ?? "";
+    if (o.pos >= text.length) {
+      o.eof = true;
+      return -1;
+    }
+    return text.charCodeAt(o.pos++);
+  };
   const writeStr = (n: Node, at: number, str: string) => {
     for (let i = 0; i < str.length; i++)
       store(n, at + i, T.char, str.charCodeAt(i));
@@ -2665,12 +3583,104 @@ export function run(
         return { t: T.int, v: str.length };
       }
       case "fputs":
-        out += readStr(n, an(0));
+        put(n, an(1), readStr(n, an(0)));
         return { t: T.int, v: 0 };
       case "fputc":
       case "putc":
-        out += String.fromCharCode(an(0) & 0xff);
-        return { t: T.int, v: an(0) };
+        put(n, an(1), String.fromCharCode(an(0) & 0xff));
+        return { t: T.int, v: an(0) & 0xff };
+      case "fopen": {
+        const name = readStr(n, an(0));
+        const mode = readStr(n, an(1));
+        if (!/^[rwa]b?\+?b?$/.test(mode))
+          fail(
+            n,
+            `fopen 의 모드 "${mode}" 는 r·w·a 에 + 나 b 를 붙인 것만 됩니다`,
+          );
+        if (mode[0] === "r" && !files.has(name)) return { t: ptr(FILE), v: 0 };
+        if (mode[0] === "w" || !files.has(name)) files.set(name, "");
+        let addr = FILE_BASE;
+        while (opened.has(addr)) addr += 8;
+        if (addr >= FILE_END) return { t: ptr(FILE), v: 0 };
+        opened.set(addr, {
+          name,
+          pos: 0,
+          read: mode[0] === "r" || mode.includes("+"),
+          write: mode[0] !== "r" || mode.includes("+"),
+          append: mode[0] === "a",
+          eof: false,
+          back: [],
+        });
+        return { t: ptr(FILE), v: addr };
+      }
+      case "fclose":
+        handle(n, an(0));
+        opened.delete(an(0));
+        return { t: T.int, v: 0 };
+      case "fgetc":
+      case "getc":
+        return { t: T.int, v: getc(n, an(0)) };
+      case "ungetc": {
+        if (an(0) === -1) return { t: T.int, v: -1 };
+        if (an(1) !== STREAMS.stdin) {
+          const f = handle(n, an(1));
+          f.back.push(an(0) & 0xff);
+          f.eof = false;
+        }
+        return { t: T.int, v: an(0) & 0xff };
+      }
+      case "fgets": {
+        let s = "";
+        while (s.length < an(1) - 1) {
+          const c = getc(n, an(2));
+          if (c < 0) break;
+          s += String.fromCharCode(c);
+          if (c === 10) break;
+        }
+        if (!s) return { t: ptr(T.char), v: 0 };
+        writeStr(n, an(0), s);
+        return { t: ptr(T.char), v: an(0) };
+      }
+      case "fread": {
+        const want = an(1) * an(2);
+        let got = 0;
+        for (; got < want; got++) {
+          const c = getc(n, an(3));
+          if (c < 0) break;
+          store(n, an(0) + got, T.uchar, c);
+        }
+        return { t: T.ulong, v: an(1) ? Math.floor(got / an(1)) : 0 };
+      }
+      case "fwrite": {
+        let s = "";
+        for (let i = 0; i < an(1) * an(2); i++)
+          s += String.fromCharCode(num(load(n, an(0) + i, T.uchar)));
+        put(n, an(3), s);
+        return { t: T.ulong, v: an(2) };
+      }
+      case "feof":
+        return {
+          t: T.int,
+          v: an(0) === STREAMS.stdin || handle(n, an(0)).eof ? 1 : 0,
+        };
+      case "ferror":
+        return { t: T.int, v: 0 };
+      case "rewind":
+      case "fseek": {
+        const f = handle(n, an(0));
+        const size = (files.get(f.name) ?? "").length;
+        const to = name === "rewind" ? 0 : an(1) + [0, f.pos, size][an(2)];
+        if (name === "fseek" && (an(2) < 0 || an(2) > 2 || to < 0))
+          return { t: T.int, v: -1 };
+        f.pos = to;
+        f.eof = false;
+        f.back = [];
+        return { t: T.int, v: 0 };
+      }
+      case "ftell":
+        return { t: T.long, v: handle(n, an(0)).pos };
+      case "remove":
+        return { t: T.int, v: files.delete(readStr(n, an(0))) ? 0 : -1 };
       case "fflush":
         return { t: T.int, v: 0 };
       // 입력은 없다: 늘 끝(EOF)
@@ -2826,8 +3836,7 @@ export function run(
             numeric = false;
             break;
           case "s":
-            s = readStr(n, num(a.v));
-            if (p !== null) s = s.slice(0, p);
+            s = readStr(n, num(a.v), p ?? undefined);
             numeric = false;
             break;
           case "p":
@@ -2990,6 +3999,7 @@ export function run(
   const record = (n: Node) => {
     if (steps.length >= limit) {
       truncated = true;
+      if (limit > 0) throw new Stop();
       return;
     }
     steps.push({
@@ -3017,11 +4027,14 @@ export function run(
     return addr;
   };
   // withInit=false: goto 가 건너뛴 선언. 이름과 자리는 생기고 값은 초기화하지 않는다(static 은 원래 시작 전에 초기화된다)
+  // 실행 중 선언자마다 읽은 이름과 타입(크기를 초깃값으로 정한 배열이면 그 크기까지). 다시 지날 때 그대로 쓴다
+  const declared = new Map<Node, { name: string; type: CType; fn?: Node }>();
   function declareLocal(n: Node, withInit = true) {
     const b = specType(n);
     for (const d of n.childrenForFieldName("declarator")) {
       if (!d) continue;
-      let { name, type, fn } = declare(b, d);
+      const memo = strict() ? undefined : declared.get(d);
+      let { name, type, fn } = memo ?? declare(b, d);
       const scope = frame().scopes[frame().scopes.length - 1];
       const init =
         d.type === "init_declarator" ? d.childForFieldName("value") : null;
@@ -3052,8 +4065,9 @@ export function run(
         scope.set(name, { ...(g ?? { addr: 0, type }), linked: true });
         continue;
       }
-      if (type.k === "array" && !type.n && init)
+      if (!memo && type.k === "array" && !type.n && init)
         type = arr(type.of, initCount(init, type.of));
+      if (!memo && !strict()) declared.set(d, { name, type });
       if (strict()) {
         if (type.k === "void") fail(d, "void 변수는 만들 수 없습니다");
         if (!complete(type))
@@ -3344,6 +4358,14 @@ export function run(
       case "for_statement":
         forLoop(n, label);
         return;
+      // goto 로 switch 안에 들어가면 조건식은 계산하지 않는다
+      case "switch_statement":
+        try {
+          resume(field(n, "body"), label);
+        } catch (e) {
+          if (!(e instanceof Break)) throw e;
+        }
+        return;
       default:
         fail(n, "이 문장 안의 레이블로는 goto 로 갈 수 없습니다");
     }
@@ -3401,6 +4423,245 @@ export function run(
   }
 
   function exec(n: Node): void {
+    if (dry || checking) {
+      execSlow(n);
+      return;
+    }
+    let c = n.code as Stmt | undefined;
+    if (!c) {
+      c = compileStmt(n);
+      n.code = c;
+    }
+    c();
+  }
+  // 문장도 처음 실행할 때 함수로 바꿔 둔다. goto 레이블이 든 블록처럼 드문 것은 execSlow 가 한다
+  type Stmt = () => void;
+  const BREAK = new Break();
+  const CONTINUE = new Continue();
+  // 조건식: 참이면 true
+  const condCode = (n: Node): (() => boolean) => {
+    const N = numCode(n);
+    if (N) return () => N() !== 0;
+    const C = codeOf(n);
+    return () => truth(rvalue(n, C()).v);
+  };
+  const hasLabel = (n: Node): boolean =>
+    n.type === "labeled_statement" || n.namedChildren.some(hasLabel);
+  // 선언의 초깃값을 그 자리에 넣는 함수
+  const initCode = (
+    d: Node,
+    type: CType,
+    init: Node,
+  ): ((addr: number) => void) => {
+    const N =
+      numeric(type) && init.type !== "initializer_list" ? numCode(init) : null;
+    if (!N) return (addr) => initialize(d, addr, type, init);
+    const st = storer(type);
+    const heapPtr = type.k === "ptr" && type.to.k !== "void" ? type.to : null;
+    return (addr) => {
+      const v = wrap(type, N()) as number;
+      if (heapPtr && v >= heapBase) {
+        const b = blockStart(v);
+        if (b && !b.ctype) b.ctype = heapPtr;
+      }
+      st(d, addr, v);
+    };
+  };
+  const compileStmt = (n: Node): Stmt => {
+    const slow: Stmt = () => execSlow(n);
+    switch (n.type) {
+      case "expression_statement": {
+        const e = n.namedChildren[0];
+        if (!e)
+          return () => {
+            tick(n);
+            record(n);
+          };
+        const E = numCode(e) ?? codeOf(e);
+        return () => {
+          tick(n);
+          record(n);
+          E();
+        };
+      }
+      case "compound_statement": {
+        if (hasLabel(n)) return slow;
+        const kids = stmts(n);
+        // 이 블록에 이름을 만드는 것이 없으면 이름 범위도 만들 필요가 없다
+        const scoped = kids.some((k) => skipped(k).length > 0);
+        if (!scoped)
+          return () => {
+            tick(n);
+            for (const k of kids) exec(k);
+          };
+        return () => {
+          tick(n);
+          const scopes = frame().scopes;
+          scopes.push(new Map());
+          try {
+            for (const k of kids) exec(k);
+          } finally {
+            scopes.pop();
+          }
+        };
+      }
+      case "declaration": {
+        if (isStatic(n) || storage(n, "extern")) return slow;
+        const b = specType(n);
+        const items: {
+          d: Node;
+          name: string;
+          type: CType;
+          init: Node | null;
+          code?: (addr: number) => void;
+        }[] = [];
+        for (const d of n.childrenForFieldName("declarator")) {
+          if (!d) continue;
+          const x = declare(b, d);
+          if (x.fn) return slow;
+          const init =
+            d.type === "init_declarator" ? d.childForFieldName("value") : null;
+          const type =
+            x.type.k === "array" && !x.type.n && init
+              ? arr(x.type.of, initCount(init, x.type.of))
+              : x.type;
+          items.push({ d, name: x.name, type, init });
+        }
+        return () => {
+          tick(n);
+          record(n);
+          const f = frame();
+          const scope = f.scopes[f.scopes.length - 1];
+          for (const it of items) {
+            let addr = f.slots.get(it.d);
+            // 반복이나 goto 로 같은 선언을 다시 지나면 그 자리를 다시 쓴다. 처음 잡은 자리는 초기화하지 않은 값으로
+            if (addr === undefined) {
+              addr = alloca(n, it.type);
+              f.slots.set(it.d, addr);
+              for (let i = 0; i < it.type.size; i++)
+                mem.setUint8(addr + i, 0xcd);
+            }
+            scope.set(it.name, { addr, type: it.type, decl: n });
+            if (it.init) {
+              it.code ??= initCode(it.d, it.type, it.init);
+              it.code(addr);
+            }
+          }
+        };
+      }
+      case "return_statement": {
+        const e = n.namedChildren[0];
+        const E = e ? codeOf(e) : null;
+        return () => {
+          tick(n);
+          record(n);
+          throw new Return(E ? rvalue(n, E()) : null);
+        };
+      }
+      case "if_statement": {
+        const C = condCode(field(n, "condition"));
+        const yes = field(n, "consequence");
+        const alt = n.childForFieldName("alternative");
+        const no = alt
+          ? alt.type === "else_clause"
+            ? (alt.namedChildren[0] ?? alt)
+            : alt
+          : null;
+        return () => {
+          tick(n);
+          record(n);
+          if (C()) exec(yes);
+          else if (no) exec(no);
+        };
+      }
+      case "while_statement": {
+        const C = condCode(field(n, "condition"));
+        const b = field(n, "body");
+        return () => {
+          tick(n);
+          for (;;) {
+            record(n);
+            if (!C()) return;
+            try {
+              exec(b);
+            } catch (e) {
+              if (e instanceof Break) return;
+              if (!(e instanceof Continue)) throw e;
+            }
+          }
+        };
+      }
+      case "do_statement": {
+        const cn = field(n, "condition");
+        let C: (() => boolean) | undefined;
+        const b = field(n, "body");
+        return () => {
+          tick(n);
+          for (;;) {
+            try {
+              exec(b);
+            } catch (e) {
+              if (e instanceof Break) return;
+              if (!(e instanceof Continue)) throw e;
+            }
+            record(n);
+            C ??= condCode(cn);
+            if (!C()) return;
+          }
+        };
+      }
+      case "for_statement": {
+        const init = n.childForFieldName("initializer");
+        const cn = n.childForFieldName("condition");
+        const un = n.childForFieldName("update");
+        const b = field(n, "body");
+        // 조건과 갱신식은 첫 칸의 선언을 지난 뒤에 함수로 바꾼다
+        let C: (() => boolean) | undefined;
+        let U: (() => unknown) | undefined;
+        return () => {
+          tick(n);
+          const scopes = frame().scopes;
+          scopes.push(new Map());
+          try {
+            if (init) {
+              record(n);
+              if (init.type === "declaration") declareLocal(init);
+              else evalExpr(init);
+            }
+            if (cn) C ??= condCode(cn);
+            if (un) U ??= numCode(un) ?? codeOf(un);
+            for (;;) {
+              record(n);
+              if (C && !C()) break;
+              try {
+                exec(b);
+              } catch (e) {
+                if (e instanceof Break) break;
+                if (!(e instanceof Continue)) throw e;
+              }
+              if (U) U();
+            }
+          } finally {
+            scopes.pop();
+          }
+        };
+      }
+      case "break_statement":
+        return () => {
+          tick(n);
+          throw BREAK;
+        };
+      case "continue_statement":
+        return () => {
+          tick(n);
+          throw CONTINUE;
+        };
+      default:
+        return slow;
+    }
+  };
+
+  function execSlow(n: Node): void {
     tick(n);
     switch (n.type) {
       case "compound_statement":
@@ -3949,6 +5210,8 @@ export function run(
     ];
     exit = num(invoke(main, mainArgs.slice(0, main.params.length), root).v);
   } catch (e) {
+    if (e instanceof Stop)
+      return { steps, out: text(out), error, exit, leaked: 0, truncated, read };
     if (e instanceof Fail) error = { line: e.line, msg: e.message };
     else if (e instanceof Exit) exit = e.code;
     // 해석기를 돌리는 JS 의 스택이 C 스택(1MB)보다 먼저 찬다

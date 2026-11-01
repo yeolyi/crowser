@@ -12,6 +12,8 @@ export class Node {
   fields = new Map<string, Node[]>();
   /** static 지역 변수의 자리(처음 선언을 지날 때 잡아 둔다) */
   memo: number | undefined;
+  /** 해석기가 이 노드를 처음 실행할 때 만들어 두는 함수 */
+  code: unknown;
 
   constructor(type: string, text: string, row: number, named = true) {
     this.type = type;

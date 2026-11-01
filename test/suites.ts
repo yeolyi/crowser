@@ -106,24 +106,24 @@ const runFile = path.join(cache, "clang-run.json");
 const runMemo: Record<string, string> = fs.existsSync(runFile)
   ? JSON.parse(fs.readFileSync(runFile, "utf8"))
   : {};
+// struct 끝 배열도 선언한 크기로 잰다. clang 기본은 옛 꼼수(끝 멤버 data[1] 을 넘겨 쓰기)를 크기 없는 배열처럼 봐 준다
+const SANITIZE = [
+  "-fsanitize=undefined,address",
+  "-fstrict-flex-arrays=3",
+  "-fno-sanitize-recover=all",
+];
 function clangRun(file: string, src: string, zero: boolean) {
-  const key = `${zero ? "0" : "-"}${createHash("sha1").update(src).digest("hex")}`;
+  const key = `${zero ? "0" : "-"}${createHash("sha1")
+    .update(SANITIZE.join(" "))
+    .update(src)
+    .digest("hex")}`;
   if (runMemo[key] === undefined) {
     const bin = path.join(cache, "clang-run");
     let why = "";
     try {
       execFileSync(
         "clang",
-        [
-          "-std=c17",
-          "-w",
-          "-g",
-          "-fsanitize=undefined,address",
-          "-fno-sanitize-recover=all",
-          "-o",
-          bin,
-          file,
-        ],
+        ["-std=c17", "-w", "-g", ...SANITIZE, "-o", bin, file],
         { stdio: "pipe" },
       );
       execFileSync(bin, [], { stdio: "pipe", timeout: 20_000, cwd: cache });

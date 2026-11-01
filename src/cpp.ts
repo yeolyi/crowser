@@ -86,6 +86,11 @@ const BUILTIN: Record<string, string> = {
   INT64_MIN: "(-9223372036854775807L - 1)",
   UINT64_MAX: "18446744073709551615UL",
   EOF: "(-1)",
+  SEEK_SET: "0",
+  SEEK_CUR: "1",
+  SEEK_END: "2",
+  FOPEN_MAX: "20",
+  FILENAME_MAX: "4096",
   CLOCKS_PER_SEC: "1000000",
   EXIT_SUCCESS: "0",
   EXIT_FAILURE: "1",
@@ -160,6 +165,7 @@ export function preprocess(src: string): {
   code: string;
   error: CppError | null;
 } {
+  const pushed = new Map<string, (Macro | undefined)[]>();
   const macros = new Map<string, Macro>([
     ...Object.entries(BUILTIN).map(([k, body]): [string, Macro] => [
       k,
@@ -447,8 +453,22 @@ export function preprocess(src: string): {
               lineShift = Number(m[1]) - i - 2;
               if (m[2]) fileName = m[2];
             }
-          } else if (kw !== "" && kw !== "pragma")
-            fail(i, `지원하지 않는 전처리 지시문 #${kw}`);
+          } else if (kw === "pragma") {
+            // push_macro·pop_macro: 표준은 아니지만 clang·gcc·MSVC 가 모두 받는다. 다른 #pragma 는 무시한다
+            const m = /^(push|pop)_macro\s*\(\s*"([^"]*)"\s*\)\s*$/.exec(
+              rest.trim(),
+            );
+            if (m) {
+              const stack = pushed.get(m[2]) ?? [];
+              pushed.set(m[2], stack);
+              if (m[1] === "push") stack.push(macros.get(m[2]));
+              else if (stack.length) {
+                const old = stack.pop();
+                if (old) macros.set(m[2], old);
+                else macros.delete(m[2]);
+              }
+            }
+          } else if (kw !== "") fail(i, `지원하지 않는 전처리 지시문 #${kw}`);
         }
       }
     }
