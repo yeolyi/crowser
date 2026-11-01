@@ -25,14 +25,16 @@ type IntType = {
   name: string;
   bits?: number;
   shift?: number;
+  q?: number;
 };
-type PtrType = { k: "ptr"; to: CType; size: 8; align: 8 };
+type PtrType = { k: "ptr"; to: CType; size: 8; align: 8; q?: number };
 type ArrayType = {
   k: "array";
   of: CType;
   n: number;
   size: number;
   align: number;
+  q?: number;
 };
 // skip: { } 초기화에서 차례로 채우지 않는 필드(이름 없는 비트 필드, 이름 없는 union 의 둘째 멤버부터)
 type Field = { name: string; type: CType; offset: number; skip?: boolean };
@@ -43,9 +45,16 @@ type StructType = {
   fields: Field[] | null;
   size: number;
   align: number;
+  q?: number;
 };
-type VoidType = { k: "void"; size: 1; align: 1; name: "void" };
-type FloatType = { k: "float"; size: 4 | 8; align: 4 | 8; name: string };
+type VoidType = { k: "void"; size: 1; align: 1; name: "void"; q?: number };
+type FloatType = {
+  k: "float";
+  size: 4 | 8;
+  align: 4 | 8;
+  name: string;
+  q?: number;
+};
 // 함수는 메모리에 없지만 포인터로 가리킬 수 있게 0x100 부터 가짜 주소를 하나씩 준다
 // params: 매개변수 타입. int f() 처럼 원형이 없으면 undefined(무엇이든 넘길 수 있다)
 type FuncType = {
@@ -56,6 +65,7 @@ type FuncType = {
   ret: CType;
   params?: CType[];
   variadic?: boolean;
+  q?: number;
 };
 export type CType =
   | IntType
@@ -105,6 +115,28 @@ const func = (ret: CType, params?: CType[], variadic = false): FuncType => ({
   variadic,
 });
 const ptr = (to: CType): PtrType => ({ k: "ptr", to, size: 8, align: 8 });
+// 한정자는 타입이 q 비트로 들고 다닌다. restrict 는 따지지 않는다
+const CONST = 1;
+const VOLATILE = 2;
+// 배열에 붙은 한정자는 원소의 것이다. 한정한 struct 는 원래 struct 를 프로토타입으로 둔다:
+// 앞서 선언만 한 struct 를 한정해 두어도 나중에 정의하면 그 필드가 보인다
+const qualify = (t: CType, q: number): CType => {
+  const all = (t.q ?? 0) | q;
+  if (!q || all === t.q || t.k === "func") return t;
+  if (t.k === "array") return arr(qualify(t.of, q), t.n);
+  if (t.k === "struct")
+    return Object.assign(Object.create(unqualified(t)), { q: all });
+  return { ...t, q: all };
+};
+const unqualified = (t: CType): CType =>
+  !t.q
+    ? t
+    : t.k === "struct"
+      ? (Object.getPrototypeOf(t) as CType)
+      : { ...t, q: undefined };
+const qualNames = (q = 0) =>
+  [q & CONST && "const", q & VOLATILE && "volatile"].filter(Boolean).join(" ");
+const isDouble = (t: CType) => t.k === "float" && t.size === 8;
 // stdio 의 FILE 은 속을 볼 수 없는 struct. stdin·stdout·stderr 는 가짜 주소(메모리 맨 앞, 아무것도 없는 곳)
 const FILE: CType = {
   k: "struct",
@@ -153,15 +185,16 @@ const arr = (of: CType, n: number): ArrayType => ({
 });
 
 export function typeName(t: CType): string {
+  const q = qualNames(t.q);
   switch (t.k) {
     case "ptr":
-      return `${typeName(t.to)} *`;
+      return `${typeName(t.to)} *${q && ` ${q}`}`;
     case "array":
       return `${typeName(t.of)}[${t.n}]`;
     case "struct":
-      return `${t.union ? "union" : "struct"} ${t.name}`;
+      return `${q && `${q} `}${t.union ? "union" : "struct"} ${t.name}`;
     default:
-      return t.name;
+      return `${q && `${q} `}${t.name}`;
   }
 }
 
@@ -705,8 +738,7 @@ export function run(
   function wrap(t: CType, v: Num): Num {
     if (t.k === "float") return t.size === 4 ? Math.fround(num(v)) : num(v);
     if (t.k !== "int") return num(v);
-    if (t === T.bool || (t.bits && t.name === T.bool.name))
-      return truth(v) ? 1 : 0;
+    if (t.name === T.bool.name) return truth(v) ? 1 : 0;
     if (t.bits !== undefined)
       return norm(
         t.signed
@@ -893,7 +925,7 @@ export function run(
     );
     for (const fd of body.namedChildren) {
       if (!fd || fd.type !== "field_declaration") continue;
-      const b = typeOf(field(fd, "type"));
+      const b = specType(fd);
       const decls = [...fd.childrenForFieldName("declarator")];
       // 이름 없는 struct·union 멤버: 그 필드들이 바깥 struct 의 필드가 된다
       if (!decls.length && b.k === "struct") {
@@ -989,6 +1021,15 @@ export function run(
   // 선언자를 풀어 이름과 타입을 얻는다. 바깥 선언자부터 타입을 감싸며 안으로 들어간다:
   // int *a[3] 은 [3] 이 바깥이라 (int * 의 배열 3), int (*a)[3] 은 * 가 바깥이라 (int[3] 을 가리키는 포인터).
   // 이름이 함수면 fn 에 그 함수 선언자(매개변수 목록이 있는 곳)를 준다
+  const quals = (n: Node) => {
+    let q = 0;
+    for (const c of n.namedChildren)
+      if (c.type === "type_qualifier")
+        q |= c.text === "const" ? CONST : c.text === "volatile" ? VOLATILE : 0;
+    return q;
+  };
+  // 선언의 기본 타입: 타입 지정자에 한정자(const int 의 const)를 붙인 것
+  const specType = (n: Node) => qualify(typeOf(field(n, "type")), quals(n));
   const declare = (
     b: CType,
     d: Node,
@@ -999,7 +1040,7 @@ export function run(
       case "type_identifier":
         return { name: d.text, type: b };
       case "pointer_declarator":
-        return declare(ptr(b), field(d, "declarator"));
+        return declare(qualify(ptr(b), quals(d)), field(d, "declarator"));
       case "array_declarator": {
         const sizeNode = d.childForFieldName("size");
         return declare(
@@ -1039,7 +1080,10 @@ export function run(
     if (!d) return b;
     switch (d.type) {
       case "abstract_pointer_declarator":
-        return abstract(ptr(b), d.childForFieldName("declarator"));
+        return abstract(
+          qualify(ptr(b), quals(d)),
+          d.childForFieldName("declarator"),
+        );
       case "abstract_array_declarator": {
         const s = d.childForFieldName("size");
         return abstract(
@@ -1066,8 +1110,10 @@ export function run(
         d,
         `함수는 ${ret.k === "func" ? "함수" : "배열"}를 돌려줄 수 없습니다`,
       );
+    // 함수 타입에서 돌려주는 타입과 매개변수의 맨 바깥 한정자는 빠진다
+    const r = unqualified(ret);
     const list = field(d, "parameters").namedChildren;
-    if (!list.length) return func(ret);
+    if (!list.length) return func(r);
     const params: CType[] = [];
     const names = new Set<string>();
     let variadic = false;
@@ -1076,7 +1122,7 @@ export function run(
         variadic = true;
         continue;
       }
-      const base = typeOf(field(p, "type"));
+      const base = specType(p);
       const pd = p.childForFieldName("declarator");
       let t = base;
       if (pd?.type.startsWith("abstract")) t = abstract(base, pd);
@@ -1088,12 +1134,12 @@ export function run(
         names.add(x.name);
       }
       if (t.k === "void") {
-        if (list.length === 1 && !pd) return func(ret, []);
+        if (list.length === 1 && !pd) return func(r, []);
         fail(p, "매개변수의 타입이 void 일 수 없습니다");
       }
-      params.push(paramType(t));
+      params.push(unqualified(paramType(t)));
     }
-    return func(ret, params, variadic);
+    return func(r, params, variadic);
   };
   // 배열 원소는 크기를 아는 타입이어야 한다
   const element = (d: Node, t: CType) => {
@@ -1180,9 +1226,10 @@ export function run(
   const rvalue = (n: Node, x: X): Val => {
     if (!x.lv) return x;
     if (x.t.k === "array") return { t: ptr(x.t.of), v: x.addr };
-    if (x.t.k === "struct") return { t: x.t, v: x.addr, agg: true };
+    if (x.t.k === "struct")
+      return { t: unqualified(x.t), v: x.addr, agg: true };
     if (x.t.k === "func") return { t: x.t, v: x.addr };
-    return { t: valueType(x.t), v: load(n, x.addr, x.t) };
+    return { t: unqualified(valueType(x.t)), v: load(n, x.addr, x.t) };
   };
 
   // 문자열 상수의 글자 값들(끝의 0 은 빼고). 이어 붙인 것 중 하나라도 넓은 문자열이면 모두 그 타입
@@ -1408,7 +1455,7 @@ export function run(
 
   // 실수가 끼면 실수로: 하나라도 double 이면 double, 아니면 float
   const floatArith = (n: Node, op: string, a: Val, b: Val): Val => {
-    const t = a.t === T.double || b.t === T.double ? T.double : T.float;
+    const t = isDouble(a.t) || isDouble(b.t) ? T.double : T.float;
     // 두 값을 먼저 t 로 바꾼다(16777217L 과 float 를 견주면 정수도 float 로 반올림된다)
     const x = num(wrap(t, a.v));
     const y = num(wrap(t, b.v));
@@ -1432,6 +1479,17 @@ export function run(
               ? x / y
               : fail(n, `실수에는 ${op}를 쓸 수 없습니다`);
     return { t, v: wrap(t, v) };
+  };
+  // const 인 자리와 const 멤버가 든 struct 는 대입·++·-- 로 바꿀 수 없다(초기화는 된다)
+  const hasConst = (t: CType): boolean =>
+    !!((t.q ?? 0) & CONST) ||
+    (t.k === "struct" && !!t.fields?.some((f) => hasConst(f.type))) ||
+    (t.k === "array" && hasConst(t.of));
+  const modifiable = (n: Node, target: Node, t: CType) => {
+    if ((t.q ?? 0) & CONST)
+      fail(n, `${target.text} 는 const 라 바꿀 수 없습니다`);
+    if (t.k === "struct" && hasConst(t))
+      fail(n, `${target.text} 에는 const 멤버가 있어 통째로 바꿀 수 없습니다`);
   };
   const assign = (
     n: Node,
@@ -1703,6 +1761,7 @@ export function run(
         const left = field(n, "left");
         const right = field(n, "right");
         const place = evalExpr(left);
+        if (strict()) modifiable(n, left, place.t);
         let val = rvalue(n, evalExpr(right));
         if (op !== "=")
           val = arith(n, op.slice(0, -1), rvalue(n, place), val, left, right);
@@ -1800,6 +1859,7 @@ export function run(
       case "update_expression": {
         const op = field(n, "operator").text;
         const place = evalExpr(field(n, "argument"));
+        if (strict()) modifiable(n, field(n, "argument"), place.t);
         const old = rvalue(n, place);
         const nv = arith(n, op === "++" ? "+" : "-", old, { t: T.int, v: 1 });
         assign(n, place, nv);
@@ -1828,7 +1888,12 @@ export function run(
         const f = st.fields?.find((x) => x.name === fname);
         if (!f) return fail(n, `${typeName(st)}에 ${fname} 필드가 없습니다`);
         const temp = op === "." && (!b.lv || !!b.temp);
-        return { t: f.type, addr: addr + f.offset, lv: true, temp };
+        return {
+          t: qualify(f.type, st.q ?? 0),
+          addr: addr + f.offset,
+          lv: true,
+          temp,
+        };
       }
       case "subscript_expression": {
         const arrayNode = field(n, "argument");
@@ -1889,7 +1954,7 @@ export function run(
       case "generic_expression": {
         // _Generic(x, int: …, char *: …, default: …): x 의 타입(배열·함수는 포인터로)과 같은 타입의 식 하나만 계산한다
         const [ctrl, ...rest] = stmts(n);
-        let t = typeOnly(ctrl);
+        let t = unqualified(typeOnly(ctrl));
         if (t.k === "array") t = ptr(t.of);
         else if (t.k === "func") t = ptr(t);
         let fallback: Node | null = null;
@@ -1912,7 +1977,7 @@ export function run(
         return { t: T.ulong, v: t.size };
       }
       case "cast_expression": {
-        const t = typeOfDescriptor(field(n, "type"));
+        const t = unqualified(typeOfDescriptor(field(n, "type")));
         const x = rvalue(n, evalExpr(field(n, "value")));
         if (t.k === "void") return { t, v: 0 };
         if (strict()) {
@@ -1948,7 +2013,7 @@ export function run(
         const vt = decay(v.t);
         if (isArith(vt) && isArith(o)) {
           const t =
-            v.t === T.double || o === T.double
+            isDouble(v.t) || isDouble(o)
               ? T.double
               : v.t.k === "float" || o.k === "float"
                 ? T.float
@@ -1964,7 +2029,12 @@ export function run(
             );
           if (vt.k === "ptr" && o.k === "ptr") {
             if (strict() && !ptrCompat(vt, o)) mismatch();
-            return { t: o.to.k === "void" ? o : vt, v: v.v };
+            // 결과는 두 쪽 한정자를 다 가진 것을 가리킨다
+            const to = (o.to.k === "void" ? o : vt).to;
+            return {
+              t: ptr(qualify(to, (vt.to.q ?? 0) | (o.to.q ?? 0))),
+              v: v.v,
+            };
           }
           if (strict() && !isNullConst(vt.k === "ptr" ? otherNode : pick))
             mismatch();
@@ -1973,7 +2043,11 @@ export function run(
         if (
           strict() &&
           !(vt.k === "void" && o.k === "void") &&
-          !(vt.k === "struct" && vt === o)
+          !(
+            vt.k === "struct" &&
+            o.k === "struct" &&
+            unqualified(vt) === unqualified(o)
+          )
         )
           fail(
             n,
@@ -2010,11 +2084,14 @@ export function run(
   };
 
   const typeOfDescriptor = (td: Node): CType =>
-    abstract(typeOf(field(td, "type")), td.childForFieldName("declarator"));
+    abstract(specType(td), td.childForFieldName("declarator"));
 
   const elemOf = (t: CType): CType => (t.k === "array" ? elemOf(t.of) : t);
   const sameType = (a: CType, b: CType): boolean => {
     if (a === b) return true;
+    if ((a.q ?? 0) !== (b.q ?? 0)) return false;
+    if (a.k === "struct" && b.k === "struct")
+      return unqualified(a) === unqualified(b);
     if (a.k === "int" && b.k === "int")
       return a.size === b.size && a.signed === b.signed && a.name === b.name;
     if (a.k === "float" && b.k === "float") return a.size === b.size;
@@ -2051,7 +2128,7 @@ export function run(
           : true;
   // 두 포인터를 섞어 쓸 수 있는가: 같은 타입을 가리키거나 한쪽이 void *(함수 포인터는 빼고)
   const ptrCompat = (a: PtrType, b: PtrType) =>
-    sameType(a.to, b.to) ||
+    sameType(unqualified(a.to), unqualified(b.to)) ||
     (a.to.k === "void" && b.to.k !== "func") ||
     (b.to.k === "void" && a.to.k !== "func");
   // 널 포인터 상수: 값이 0 인 정수 상수식, 또는 그것을 (void *) 로 바꾼 것
@@ -2085,12 +2162,14 @@ export function run(
     if (isArith(to) && isArith(from)) return;
     if (to.k === "int" && to.name === T.bool.name && from.k === "ptr") return;
     if (to.k === "struct") {
-      if (from !== to) bad();
+      if (from.k !== "struct" || unqualified(from) !== unqualified(to)) bad();
       return;
     }
     if (to.k === "ptr") {
       if (from.k === "ptr") {
         if (!ptrCompat(to, from)) bad("(가리키는 타입이 다릅니다)");
+        const lost = (from.to.q ?? 0) & ~(to.to.q ?? 0);
+        if (lost) bad(`(가리키는 쪽의 ${qualNames(lost)} 가 사라집니다)`);
         return;
       }
       if (isNullConst(src)) return;
@@ -2136,7 +2215,7 @@ export function run(
         if (
           (isArith(A) && isArith(B)) ||
           (obj(A) && B.k === "int") ||
-          (obj(A) && obj(B) && sameType(A.to, B.to))
+          (obj(A) && obj(B) && sameType(unqualified(A.to), unqualified(B.to)))
         )
           return;
         return bad();
@@ -2149,7 +2228,7 @@ export function run(
           (A.k === "ptr" &&
             B.k === "ptr" &&
             A.to.k !== "func" &&
-            sameType(A.to, B.to))
+            sameType(unqualified(A.to), unqualified(B.to)))
         )
           return;
         return bad();
@@ -2843,7 +2922,7 @@ export function run(
   const show = (t: CType, addr: number, depth = 0): string => {
     try {
       if (t.k === "array") {
-        if (t.of === T.char) {
+        if (t.of.k === "int" && t.of.name === T.char.name) {
           const bytes: string[] = [];
           for (let i = 0; i < t.n; i++) {
             const c = mem.getUint8(addr + i);
@@ -2874,7 +2953,7 @@ export function run(
         return formatFloat(num(load(null, addr, t)), "g", 6, "");
       if (t.k !== "int") return "?";
       const v = load(null, addr, t);
-      if (t === T.char && v >= 32 && v < 127)
+      if (t.name === T.char.name && v >= 32 && v < 127)
         return `${v} '${String.fromCharCode(num(v))}'`;
       return String(v);
     } catch {
@@ -2939,8 +3018,7 @@ export function run(
   };
   // withInit=false: goto 가 건너뛴 선언. 이름과 자리는 생기고 값은 초기화하지 않는다(static 은 원래 시작 전에 초기화된다)
   function declareLocal(n: Node, withInit = true) {
-    const typeNode = field(n, "type");
-    const b = typeOf(typeNode);
+    const b = specType(n);
     for (const d of n.childrenForFieldName("declarator")) {
       if (!d) continue;
       let { name, type, fn } = declare(b, d);
@@ -3437,7 +3515,7 @@ export function run(
         typeOf(top);
         return;
       case "type_definition": {
-        const b = typeOf(field(top, "type"));
+        const b = specType(top);
         for (const d of top.childrenForFieldName("declarator")) {
           if (!d) continue;
           const { name, type } = declare(b, d);
@@ -3460,10 +3538,7 @@ export function run(
         return;
       }
       case "function_definition": {
-        const decl = declare(
-          typeOf(field(top, "type")),
-          field(top, "declarator"),
-        );
+        const decl = declare(specType(top), field(top, "declarator"));
         if (!decl.fn || decl.type.k !== "func")
           return fail(top, "함수 정의의 선언을 읽지 못했습니다");
         const { name } = decl;
@@ -3487,7 +3562,7 @@ export function run(
             if (pt.text === "void") continue;
             return fail(p, "매개변수 이름이 없습니다");
           }
-          const pdecl = declare(typeOf(pt), pd);
+          const pdecl = declare(specType(p), pd);
           const type = paramType(pdecl.type);
           if (strict() && !complete(type))
             fail(
@@ -3512,8 +3587,7 @@ export function run(
         return;
       }
       case "declaration": {
-        const typeNode = field(top, "type");
-        const b = typeOf(typeNode);
+        const b = specType(top);
         const how = isStatic(top)
           ? "static"
           : storage(top, "extern")
@@ -3674,7 +3748,7 @@ export function run(
             if (
               init
                 .childrenForFieldName("declarator")
-                .some((d) => declare(typeOf(field(init, "type")), d).fn)
+                .some((d) => declare(specType(init), d).fn)
             )
               fail(init, "for 의 첫 칸에는 함수를 선언할 수 없습니다");
             declareLocal(init);
