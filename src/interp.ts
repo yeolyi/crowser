@@ -703,9 +703,20 @@ export function run(
         return declare(b, field(d, "declarator"));
       case "function_declarator": {
         // int f(int) 는 함수 원형, int (*f)(int) 는 함수를 가리키는 포인터
-        const inner = field(d, "declarator");
-        if (inner.type === "identifier")
-          return { name: inner.text, type: func(b), fn: d };
+        let inner = field(d, "declarator");
+        // int (f)(void) 처럼 이름에 괄호를 쳐도 함수 이름이다
+        while (
+          inner.type === "parenthesized_declarator" &&
+          inner.namedChildren[0]?.type === "parenthesized_declarator"
+        )
+          inner = inner.namedChildren[0];
+        const bare =
+          inner.type === "parenthesized_declarator" &&
+          inner.namedChildren[0]?.type === "identifier"
+            ? inner.namedChildren[0]
+            : inner;
+        if (bare.type === "identifier")
+          return { name: bare.text, type: func(b), fn: d };
         return declare(func(b), inner);
       }
       case "parenthesized_declarator":
@@ -991,10 +1002,31 @@ export function run(
     store(n, place.addr, place.t, wrap(place.t, val.v));
   };
 
+  // int a[] = … 의 크기: 문자열이면 글자 수 + 1, { } 면 가장 뒤 자리 + 1([5] = 1 처럼 자리를 정할 수 있다)
+  const initCount = (init: Node) => {
+    if (init.type === "string_literal" || init.type === "concatenated_string")
+      return literal(init).length + 1;
+    let i = 0;
+    let most = 0;
+    for (const it of init.namedChildren) {
+      if (it.type === "comment") continue;
+      if (it.type === "initializer_pair") {
+        const des = field(it, "designator");
+        if (des.type === "subscript_designator" && des.namedChildren[0])
+          i = constEval(des.namedChildren[0]);
+      }
+      most = Math.max(most, ++i);
+    }
+    return most;
+  };
+
   // 초기화: 배열·struct 는 { … } 로, 나머지는 식으로
   const initialize = (n: Node, addr: number, type: CType, v: Node) => {
-    if (type.k === "array" && v.type === "string_literal") {
-      const str = unquote(v.text.slice(1, -1));
+    if (
+      type.k === "array" &&
+      (v.type === "string_literal" || v.type === "concatenated_string")
+    ) {
+      const str = literal(v);
       if (str.length > type.n) fail(n, "문자열이 배열보다 깁니다");
       for (let i = 0; i < type.n; i++)
         store(n, addr + i, T.char, i < str.length ? str.charCodeAt(i) : 0);
@@ -1168,6 +1200,14 @@ export function run(
         const op = field(n, "operator").text;
         const argNode = field(n, "argument");
         if (op === "&") {
+          // &*p 는 p 다(따라가지 않으니 NULL 이어도 된다)
+          if (
+            argNode.type === "pointer_expression" &&
+            argNode.childForFieldName("operator")?.text === "*"
+          ) {
+            const p = rvalue(n, evalExpr(field(argNode, "argument")));
+            if (p.t.k === "ptr") return p;
+          }
           const x = evalExpr(argNode);
           if (x.t.k === "func")
             return { t: ptr(x.t), v: x.lv ? x.addr : num(x.v) };
@@ -1212,9 +1252,15 @@ export function run(
       }
       case "subscript_expression": {
         const arrayNode = field(n, "argument");
-        const base0 = evalExpr(arrayNode);
+        let base0 = evalExpr(arrayNode);
+        let i = rvalue(n, evalExpr(field(n, "index")));
+        // a[i] 는 *(a + i) 라 i[a] 도 같다
+        if (base0.t.k === "int" && (i.t.k === "ptr" || i.t.k === "array")) {
+          const swap = rvalue(n, base0);
+          base0 = i;
+          i = swap;
+        }
         const a = rvalue(n, base0);
-        const i = rvalue(n, evalExpr(field(n, "index")));
         if (a.t.k !== "ptr")
           return fail(n, "[] 앞은 배열이나 포인터여야 합니다");
         const iv = num(i.v);
@@ -1232,7 +1278,7 @@ export function run(
       }
       case "sizeof_expression": {
         const tn = n.childForFieldName("type");
-        if (tn) return { t: T.ulong, v: typeOfDescriptor(tn).size };
+        if (tn) return { t: T.ulong, v: descriptorOrExpr(tn).size };
         return { t: T.ulong, v: typeOnly(field(n, "value")).size };
       }
       case "cast_expression": {
@@ -1269,7 +1315,7 @@ export function run(
         // (Point){1, 2}: 이름 없는 변수를 지금 함수의 스택에 잡아 초기화한다
         let t = typeOfDescriptor(field(n, "type"));
         const init = field(n, "value");
-        if (t.k === "array" && !t.n) t = arr(t.of, init.namedChildren.length);
+        if (t.k === "array" && !t.n) t = arr(t.of, initCount(init));
         const addr = frames.length ? alloca(n, t) : staticAlloc(n, t);
         initialize(n, addr, t, init);
         return { t, addr, lv: true };
@@ -1284,6 +1330,24 @@ export function run(
     return globals.has(name);
   };
 
+  // sizeof(f()) 와 sizeof(x) 를 파서가 타입(f 를 돌려주는 함수, 타입 x)으로 읽을 때가 있다.
+  // 그 이름이 타입이 아니라 함수나 변수면 식으로 본다
+  const descriptorOrExpr = (td: Node): CType => {
+    const base = field(td, "type");
+    const name = base.text;
+    if (
+      base.type === "type_identifier" &&
+      !typedefs.has(name) &&
+      !STD_TYPES[name] &&
+      (funcs.has(name) || lookupMaybe(name))
+    ) {
+      const d = td.childForFieldName("declarator");
+      if (d?.type === "abstract_function_declarator")
+        return funcs.get(name)?.ret ?? T.int;
+      if (!d) return lookup(base, name).type;
+    }
+    return typeOfDescriptor(td);
+  };
   const typeOfDescriptor = (td: Node): CType =>
     abstract(typeOf(field(td, "type")), td.childForFieldName("declarator"));
 
@@ -1546,6 +1610,7 @@ export function run(
     fmin: Math.min,
     fmax: Math.max,
     fdim: (x, y) => Math.max(x - y, 0),
+    ldexp: (x, y) => x * 2 ** y,
     copysign: (x, y) => Math.abs(x) * (y < 0 || Object.is(y, -0) ? -1 : 1),
   };
   const libCall = (n: Node, name: string, args: Val[]): Val | null => {
@@ -2019,13 +2084,8 @@ export function run(
       }
       const init =
         d.type === "init_declarator" ? d.childForFieldName("value") : null;
-      if (type.k === "array" && !type.n && init) {
-        const n0 =
-          init.type === "string_literal"
-            ? unquote(init.text.slice(1, -1)).length + 1
-            : init.namedChildren.length;
-        type = arr(type.of, n0);
-      }
+      if (type.k === "array" && !type.n && init)
+        type = arr(type.of, initCount(init));
       // static 지역 변수는 전역 자리에 한 번만 잡고 처음 한 번만 초기화한다
       if (isStatic(n)) {
         if (d.memo === undefined) {
@@ -2087,6 +2147,15 @@ export function run(
   const stmts = (n: Node) =>
     n.namedChildren.filter((c) => c.type !== "comment");
 
+  // 건너뛴 문장 안에서 이 블록에 이름을 만드는 선언(case·레이블은 블록이 아니라 그 안의 선언도 이 블록 것)
+  const skipped = (k: Node): Node[] =>
+    k.type === "declaration"
+      ? [k]
+      : k.type === "case_statement"
+        ? caseBody(k).flatMap(skipped)
+        : k.type === "labeled_statement"
+          ? skipped(labeled(k))
+          : [];
   const declaredHere = (scope: Map<string, Binding>, k: Node) =>
     [...scope.values()].some((b) => b.decl === k);
   function runBlock(n: Node, start: string | null) {
@@ -2105,9 +2174,8 @@ export function run(
             for (const [name, b] of scope)
               if (b.decl && kids.indexOf(b.decl) >= at) scope.delete(name);
             // 건너뛴 선언도 그 블록 안에선 이름이 있다
-            for (const k of kids.slice(0, at))
-              if (k.type === "declaration" && !declaredHere(scope, k))
-                declareLocal(k, false);
+            for (const k of kids.slice(0, at).flatMap(skipped))
+              if (!declaredHere(scope, k)) declareLocal(k, false);
             target = null;
             i = at + 1;
             resume(kids[at], label);
@@ -2138,8 +2206,8 @@ export function run(
           return;
         }
         const at = kids.findIndex((k) => labelsOf(k).has(label));
-        for (const k of kids.slice(0, at))
-          if (k.type === "declaration") declareLocal(k, false);
+        for (const k of kids.slice(0, at).flatMap(skipped))
+          declareLocal(k, false);
         resume(kids[at], label);
         for (const k of kids.slice(at + 1)) exec(k);
         return;
@@ -2385,12 +2453,7 @@ export function run(
           const init =
             d.type === "init_declarator" ? d.childForFieldName("value") : null;
           if (type.k === "array" && !type.n && init)
-            type = arr(
-              type.of,
-              init.type === "string_literal"
-                ? unquote(init.text.slice(1, -1)).length + 1
-                : init.namedChildren.length,
-            );
+            type = arr(type.of, initCount(init));
           // 같은 전역을 여러 번 선언할 수 있다(extern int a; int a = 1;). 크기가 정해지는 선언에서 자리를 잡는다
           const known = globals.get(name);
           const addr =
