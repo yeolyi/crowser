@@ -1,6 +1,6 @@
 // 브라우저에서 C 를 돌린다. 워커 하나를 띄워 두고 요청을 차례로 보낸다.
 // 돌고 있는 요청을 그만두면(signal) 워커를 내리고 새로 띄워, 남은 요청을 다시 보낸다(끝나지 않는 반복도 바로 끊긴다)
-import type { CResult } from "./interp.ts";
+import type { CResult, run } from "./interp.ts";
 import type { ToWorker } from "./worker.ts";
 import { workerUrl } from "./worker-url.ts";
 
@@ -45,17 +45,21 @@ const restart = () => {
 };
 
 /**
- * C 코드를 돌려 줄마다의 기록을 받는다. limit 은 기록할 단계 수(넘으면 기록만 그치고 끝까지 돈다. 0 이면 기록 없이 가장 빠르게).
- * signal 로 그만두면 AbortError 로 끝난다
+ * C 코드를 돌려 줄마다의 기록을 받는다. 옵션은 run 과 같다(limit 기본 2000).
+ * signal 로 그만두면 AbortError 로 끝난다(ops: Infinity 로 끝없이 돌리다 정지 버튼으로 끊을 수 있다)
  */
 export function runC(
   code: string,
-  { limit = 2000, signal }: { limit?: number; signal?: AbortSignal } = {},
+  {
+    signal,
+    limit = 2000,
+    ...rest
+  }: NonNullable<Parameters<typeof run>[1]> & { signal?: AbortSignal } = {},
 ): Promise<CRun> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(signal.reason);
     const id = nextId++;
-    const msg: ToWorker = { id, code, limit };
+    const msg: ToWorker = { id, code, options: { limit, ...rest } };
     jobs.set(id, { msg, resolve, reject });
     signal?.addEventListener("abort", () => {
       if (!jobs.has(id)) return;

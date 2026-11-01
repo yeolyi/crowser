@@ -598,17 +598,24 @@ const PREFIX_TYPE: Record<string, CType> = { L: T.int, u: T.ushort, U: T.uint };
 
 // 실행은 두 번까지 한다. 먼저 줄마다 기록하며 limit 단계까지 돌고, 그 안에 끝나면 그 결과가 전부다.
 // 기록이 한도에 닿으면 기록 없이 처음부터 빠르게(JS 로 옮겨) 다시 돌려 출력·종료 코드·오류를 얻는다.
-// 같은 프로그램은 같게 돌아(입력이 없고 rand 도 씨앗이 같다) 기록은 빠른 실행의 앞부분과 같다
+// 같은 프로그램은 같게 돌아(입력이 없고 rand 도 씨앗이 같다) 기록은 빠른 실행의 앞부분과 같다.
+// finish: false 면 기록 한도에서 그친다(끝나지 않는 프로그램도 기록 한도에서 멈춘다).
+// ops: 끝나지 않는 반복으로 보고 멈출 연산 수. Infinity 면 멈추지 않는다(부르는 쪽이 워커를 내려 끊는다)
 export function run(
   src: string,
-  { limit = 3000, ops }: { limit?: number; ops?: number } = {},
+  {
+    limit = 3000,
+    ops,
+    finish = true,
+  }: { limit?: number; ops?: number; finish?: boolean } = {},
 ): CResult {
   if (limit > 0) {
     const r = execute(src, { limit, ops, fast: false });
     // 한도 안에서 끝났으면 그대로. 시간·재귀 한도는 빠른 실행이 더 넉넉하다
     if (
-      !r.truncated &&
-      !/^(너무 오래|재귀가 너무 깊어)/.test(r.error?.msg ?? "")
+      !finish ||
+      (!r.truncated &&
+        !/^(너무 오래|재귀가 너무 깊어)/.test(r.error?.msg ?? ""))
     )
       return r;
     const f = execute(src, { limit: 0, ops, fast: true });
@@ -6488,7 +6495,7 @@ return 0;
     else if (e instanceof RangeError && /call stack/i.test(e.message))
       error = {
         line: here ? lineOf(here) : null,
-        msg: "재귀가 너무 깊어 멈췄습니다. 이 실행기는 함수를 수천 번까지 겹쳐 부를 수 있습니다",
+        msg: "재귀가 너무 깊어 멈췄습니다. 이 실행기가 겹쳐 부를 수 있는 함수 수(수백~수천 번)를 넘었습니다",
       };
     else
       error = {

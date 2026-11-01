@@ -75,7 +75,8 @@ No bundler setup is needed: the worker is inlined into the package.
 | Option  | Default | Description                                                                                                  |
 | ------- | ------- | ------------------------------------------------------------------------------------------------------------ |
 | `limit` | `3000`  | Steps to record. Past this, recording stops but the program still runs to the end. `0` = no recording, fastest. |
-| `ops`   | `2e7`   | Infinite-loop guard: interpreter steps while recording. The fast pass allows 25× that in loop iterations and calls. |
+| `ops`   | `2e7`   | Infinite-loop guard: interpreter steps while recording. The fast pass allows 25× that in loop iterations and calls. `Infinity` = never give up (stop it with `runC`'s `signal`). |
+| `finish` | `true` | When recording hits `limit`, rerun without recording to get the final output. `false` stops at `limit`, so even an infinite loop ends. |
 
 ```ts
 type CResult = {
